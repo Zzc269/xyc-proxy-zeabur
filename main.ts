@@ -1,6 +1,6 @@
 /**
  * xyc relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
- * Single-file version for Deno Deploy Playground (v2: force non-stream + SSE conversion)
+ * Single-file version for Deno/Zeabur (v3: persistent inbound/outbound request audit)
  *
  * LobeHub Anthropic Base URL:
  * https://YOUR_PROJECT.deno.dev
@@ -17,7 +17,8 @@
  * 2. Appends current time after the cache breakpoint of the last user message
  *    (the time block itself is never cached).
  * 3. Each incoming request triggers exactly 1 upstream request, no auto retry.
- * 4. /logs shows breakpoints, cache usage, raw failures and request ids.
+ * 4. Writes one JSON audit file per request before calling the upstream.
+ * 5. /logs shows runtime summaries; persistent request files live in LOG_DIR.
  *
  * Optional env vars:
  * UPSTREAM_URL        default https://cn.chatapi.app
@@ -29,6 +30,10 @@
  * TIME_ZONE           default Asia/Shanghai
  * DEBUG               "1" = print detailed logs for successful requests too
  * FORCE_NON_STREAM    "0" = passthrough streaming (may hit upstream 502); default force non-stream + SSE
+ * LOG_DIR             persistent request log directory; default /data/logs
+ * LOG_REQUIRED        "0" = continue if a request log cannot be written; default fail closed
+ * LOG_SENSITIVE_HEADERS "1" = store API keys/tokens/cookies in clear text; default redact
+ * PORT                 HTTP listen port; default 8000
  */
 
 const PROVIDER = "xyc";
@@ -50,6 +55,11 @@ const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
+const LOG_DIR = (Deno.env.get("LOG_DIR") || "/data/logs").replace(/[\\/]+$/, "");
+const LOG_REQUIRED = Deno.env.get("LOG_REQUIRED") !== "0";
+const LOG_SENSITIVE_HEADERS = Deno.env.get("LOG_SENSITIVE_HEADERS") === "1";
+const parsedPort = Number(Deno.env.get("PORT") || "8000");
+const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? Math.trunc(parsedPort) : 8000;
 
 const parsedTail = Number(Deno.env.get("TAIL_BREAKPOINTS") ?? "2");
 const TAIL_BREAKPOINTS = Number.isFinite(parsedTail)
@@ -93,6 +103,41 @@ const STRIP_HEADERS = [
 const LOG_LINES: string[] = [];
 let sequence = 0;
 
+const SENSITIVE_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "set-cookie",
+  "x-api-key",
+  "x-auth-token",
+  "x-proxy-token",
+]);
+
+interface StoredBody {
+  encoding: "none" | "utf-8" | "base64";
+  bytes: number;
+  content: string;
+}
+
+interface StoredRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: StoredBody;
+}
+
+interface RequestAudit {
+  schema: "xyc-request-audit-v1";
+  id: string;
+  createdAt: string;
+  inbound: StoredRequest;
+  outbound: StoredRequest | null;
+  transform: Record<string, unknown>;
+  security: {
+    sensitiveHeaders: "included" | "redacted";
+  };
+}
+
 function isObj(v: unknown): v is Record<string, Any> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -113,6 +158,91 @@ function safeEqual(a: string, b: string): boolean {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+function requestId(): string {
+  const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+  return `${stamp}-${++sequence}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function redactUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/(?:api.?key|auth|password|secret|token)/i.test(key)) {
+        url.searchParams.set(key, "[REDACTED]");
+      }
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function storedHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of headers.entries()) {
+    out[name] = !LOG_SENSITIVE_HEADERS && SENSITIVE_HEADERS.has(name.toLowerCase())
+      ? "[REDACTED]"
+      : value;
+  }
+  return out;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function storedBody(bytes: Uint8Array | null, contentType: string | null): StoredBody {
+  if (!bytes) return { encoding: "none", bytes: 0, content: "" };
+  const textual = !contentType ||
+    /^(?:application\/(?:json|.*\+json|xml|x-www-form-urlencoded)|text\/)/i.test(contentType);
+  return {
+    encoding: textual ? "utf-8" : "base64",
+    bytes: bytes.byteLength,
+    content: textual ? new TextDecoder().decode(bytes) : bytesToBase64(bytes),
+  };
+}
+
+async function writeTextAtomic(path: string, text: string): Promise<void> {
+  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+  try {
+    await Deno.writeTextFile(temporary, text);
+    await Deno.rename(temporary, path);
+  } catch (error) {
+    try {
+      await Deno.remove(temporary);
+    } catch {
+      // The temporary file may not have been created.
+    }
+    throw error;
+  }
+}
+
+async function persistRequestAudit(audit: RequestAudit): Promise<string | null> {
+  const path = `${LOG_DIR}/${audit.id}.json`;
+  try {
+    await Deno.mkdir(LOG_DIR, { recursive: true });
+    await writeTextAtomic(path, `${JSON.stringify(audit, null, 2)}\n`);
+    console.log(`AUDIT id=${audit.id} file=${path}`);
+    return path;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    record(`#${audit.id} ${clock()} audit-write-error=${message}`, true);
+    if (LOG_REQUIRED) throw error;
+    return null;
+  }
+}
+
+async function readRequestBody(req: Request): Promise<Uint8Array | null> {
+  if (!req.body) return null;
+  return new Uint8Array(await req.arrayBuffer());
 }
 
 function normalizePath(pathname: string): string {
@@ -757,6 +887,10 @@ async function handler(req: Request): Promise<Response> {
       forceNonStream: FORCE_NON_STREAM,
       upstreamAttemptsPerIncomingRequest: 1,
       logsInThisInstance: LOG_LINES.length,
+      fullRequestLogging: true,
+      requestLogDir: LOG_DIR,
+      requestLogRequired: LOG_REQUIRED,
+      sensitiveHeadersInLogs: LOG_SENSITIVE_HEADERS,
     });
   }
 
@@ -774,16 +908,51 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  const id = `${++sequence}-${crypto.randomUUID().slice(0, 8)}`;
+  const id = requestId();
   const target = resolveUpstream(path) + url.search;
+  const inboundHeaders = new Headers(req.headers);
   const headers = new Headers(req.headers);
   for (const header of STRIP_HEADERS) headers.delete(header);
   headers.set("x-proxy-request-id", id);
 
+  let inboundBytes: Uint8Array | null;
+  try {
+    inboundBytes = await readRequestBody(req);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    record(`#${id} ${clock()} path=${path} body-read-error=${message}`, true);
+    return json({ error: `request body read error: ${message}` }, 400, id);
+  }
+
   const rewriteable = req.method === "POST" && (isMessagesPath(path) || isChatPath(path));
   if (!rewriteable) {
     const head = `#${id} ${clock()} path=${path} passthrough`;
-    return await forwardOnce(req.method, target, headers, req.body, {
+    try {
+      await persistRequestAudit({
+        schema: "xyc-request-audit-v1",
+        id,
+        createdAt: new Date().toISOString(),
+        inbound: {
+          method: req.method,
+          url: redactUrl(url.toString()),
+          headers: storedHeaders(inboundHeaders),
+          body: storedBody(inboundBytes, inboundHeaders.get("content-type")),
+        },
+        outbound: {
+          method: req.method,
+          url: redactUrl(target),
+          headers: storedHeaders(headers),
+          body: storedBody(inboundBytes, headers.get("content-type")),
+        },
+        transform: { mode: "passthrough" },
+        security: {
+          sensitiveHeaders: LOG_SENSITIVE_HEADERS ? "included" : "redacted",
+        },
+      });
+    } catch {
+      return json({ error: "request audit log could not be written" }, 503, id);
+    }
+    return await forwardOnce(req.method, target, headers, inboundBytes, {
       id,
       head,
       path,
@@ -792,9 +961,29 @@ async function handler(req: Request): Promise<Response> {
 
   let body: Any;
   try {
-    body = JSON.parse(await req.text());
+    body = JSON.parse(new TextDecoder().decode(inboundBytes ?? new Uint8Array()));
   } catch {
     record(`#${id} ${clock()} path=${path} bad-json`, true);
+    try {
+      await persistRequestAudit({
+        schema: "xyc-request-audit-v1",
+        id,
+        createdAt: new Date().toISOString(),
+        inbound: {
+          method: req.method,
+          url: redactUrl(url.toString()),
+          headers: storedHeaders(inboundHeaders),
+          body: storedBody(inboundBytes, inboundHeaders.get("content-type")),
+        },
+        outbound: null,
+        transform: { mode: "rejected", reason: "bad-json" },
+        security: {
+          sensitiveHeaders: LOG_SENSITIVE_HEADERS ? "included" : "redacted",
+        },
+      });
+    } catch {
+      return json({ error: "bad json body; request audit log could not be written" }, 503, id);
+    }
     return json({ error: "bad json body" }, 400, id);
   }
 
@@ -865,13 +1054,47 @@ async function handler(req: Request): Promise<Response> {
     `betaOut=${headers.get("anthropic-beta") ?? "-"}`,
   ].filter(Boolean).join(" ");
 
+  const outboundBytes = new TextEncoder().encode(JSON.stringify(body));
+  try {
+    await persistRequestAudit({
+      schema: "xyc-request-audit-v1",
+      id,
+      createdAt: new Date().toISOString(),
+      inbound: {
+        method: req.method,
+        url: redactUrl(url.toString()),
+        headers: storedHeaders(inboundHeaders),
+        body: storedBody(inboundBytes, inboundHeaders.get("content-type")),
+      },
+      outbound: {
+        method: "POST",
+        url: redactUrl(target),
+        headers: storedHeaders(headers),
+        body: storedBody(outboundBytes, headers.get("content-type")),
+      },
+      transform: {
+        mode: "rewrite",
+        cache: cacheNote,
+        currentTime: timeNote,
+        stream: streamNote,
+        breakpointsBefore: bpIn,
+        breakpointsAfter: scanBreakpoints(body),
+      },
+      security: {
+        sensitiveHeaders: LOG_SENSITIVE_HEADERS ? "included" : "redacted",
+      },
+    });
+  } catch {
+    return json({ error: "request audit log could not be written" }, 503, id);
+  }
+
   return await forwardOnce(
     "POST",
     target,
     headers,
-    JSON.stringify(body),
+    outboundBytes,
     { id, head, path, convertSse },
   );
 }
 
-Deno.serve(handler);
+Deno.serve({ port: PORT }, handler);

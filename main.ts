@@ -1,6 +1,6 @@
 /**
  * xyc relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
- * Single-file version for Deno/Zeabur (v3: persistent inbound/outbound request audit)
+ * Single-file version for Deno/Zeabur (v3.1: stable message normalization + request audit)
  *
  * LobeHub Anthropic Base URL:
  * https://YOUR_PROJECT.deno.dev
@@ -14,11 +14,13 @@
  * Default behavior:
  * 1. Removes LobeHub's built-in 5m breakpoints, places a single 1h breakpoint on
  *    the last message (it caches all preceding tools/system/messages).
- * 2. Appends current time after the cache breakpoint of the last user message
+ * 2. Normalizes all Anthropic message text content to stable block form so a
+ *    previous newest message keeps the same cache prefix on the next turn.
+ * 3. Appends current time after the cache breakpoint of the last user message
  *    (the time block itself is never cached).
- * 3. Each incoming request triggers exactly 1 upstream request, no auto retry.
- * 4. Writes one JSON audit file per request before calling the upstream.
- * 5. /logs shows runtime summaries; persistent request files live in LOG_DIR.
+ * 4. Each incoming request triggers exactly 1 upstream request, no auto retry.
+ * 5. Writes one JSON audit file per request before calling the upstream.
+ * 6. /logs shows runtime summaries; persistent request files live in LOG_DIR.
  *
  * Optional env vars:
  * UPSTREAM_URL        default https://cn.chatapi.app
@@ -394,6 +396,60 @@ function toBlocks(v: unknown): Record<string, Any>[] | null {
     return blocks.length > 0 ? blocks : null;
   }
   return null;
+}
+
+interface NormalizeResult {
+  stringMessages: number;
+  textBlocks: number;
+}
+
+/**
+ * LobeHub may send the newest message as a text-block array while serializing
+ * that same message as a plain string on the next turn. Normalize every
+ * message, not only the newest one, so the cached prefix remains stable.
+ */
+function normalizeAnthropicMessages(body: Any): NormalizeResult {
+  const result: NormalizeResult = { stringMessages: 0, textBlocks: 0 };
+  if (!Array.isArray(body?.messages)) return result;
+
+  for (const msg of body.messages) {
+    if (!isObj(msg)) continue;
+
+    if (typeof msg.content === "string") {
+      if (msg.content.trim() === "") continue;
+      msg.content = [{ type: "text", text: msg.content }];
+      result.stringMessages++;
+      result.textBlocks++;
+      continue;
+    }
+
+    if (!Array.isArray(msg.content)) continue;
+    msg.content = msg.content.map((block: unknown) => {
+      if (
+        !isObj(block) ||
+        block.type !== "text" ||
+        typeof block.text !== "string"
+      ) {
+        return block;
+      }
+
+      const {
+        type: _type,
+        text,
+        cache_control,
+        ...rest
+      } = block;
+      result.textBlocks++;
+      return {
+        type: "text",
+        text,
+        ...rest,
+        ...(cache_control === undefined ? {} : { cache_control }),
+      };
+    });
+  }
+
+  return result;
 }
 
 function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | null {
@@ -1003,6 +1059,9 @@ async function handler(req: Request): Promise<Response> {
   const betaIn = headers.get("anthropic-beta") ?? "-";
   const bpIn = scanBreakpoints(body);
   const removedRuntime = removeOldRuntimeBlocks(body);
+  const normalization = isMessagesPath(path)
+    ? normalizeAnthropicMessages(body)
+    : { stringMessages: 0, textBlocks: 0 };
 
   let cacheNote = "off";
   if (CACHE_ENABLED) {
@@ -1056,6 +1115,7 @@ async function handler(req: Request): Promise<Response> {
     `bpOut=${scanBreakpoints(body)}`,
     `cache=${cacheNote}`,
     `time=${timeNote}`,
+    `norm=${normalization.stringMessages}/${normalization.textBlocks}`,
     removedRuntime > 0 ? `oldTimeRemoved=${removedRuntime}` : "",
     `betaIn=${betaIn}`,
     `betaOut=${headers.get("anthropic-beta") ?? "-"}`,
@@ -1084,6 +1144,7 @@ async function handler(req: Request): Promise<Response> {
         cache: cacheNote,
         currentTime: timeNote,
         stream: streamNote,
+        messageNormalization: normalization,
         breakpointsBefore: bpIn,
         breakpointsAfter: scanBreakpoints(body),
       },

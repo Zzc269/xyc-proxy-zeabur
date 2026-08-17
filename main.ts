@@ -245,6 +245,13 @@ async function readRequestBody(req: Request): Promise<Uint8Array | null> {
   return new Uint8Array(await req.arrayBuffer());
 }
 
+function requestBodyInit(bytes: Uint8Array | null): ArrayBuffer | null {
+  if (!bytes) return null;
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 function normalizePath(pathname: string): string {
   return pathname.replace(/\/+$/, "") || "/";
 }
@@ -952,7 +959,7 @@ async function handler(req: Request): Promise<Response> {
     } catch {
       return json({ error: "request audit log could not be written" }, 503, id);
     }
-    return await forwardOnce(req.method, target, headers, inboundBytes, {
+    return await forwardOnce(req.method, target, headers, requestBodyInit(inboundBytes), {
       id,
       head,
       path,

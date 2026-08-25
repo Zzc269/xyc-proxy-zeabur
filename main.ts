@@ -65,13 +65,6 @@ function resolveUpstream(p) { return UPSTREAM + p; }
  * so the cache prefix stays byte-identical -> reliable hits.
  * Tools/messages are left completely untouched.
  */
-if (isMessagesPath(path)) {
-  const sysHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(body.system)));
-  const hex = [...new Uint8Array(sysHash)].map(b => b.toString(16).padStart(2, "0")).join("");
-  console.log("sysLen:", JSON.stringify(body.system).length, "sysHash:", hex.slice(0, 16));
-  injectSystemCache(body);
-  ...
-}
 function injectSystemCache(body) {
   if (body.system === undefined) return;
 

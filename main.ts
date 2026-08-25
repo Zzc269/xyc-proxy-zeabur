@@ -209,10 +209,22 @@ async function handler(req) {
 
   // Only inject on the system prompt — the most stable part.
   if (isMessagesPath(path)) {
+    // ======== 新增调试日志：打印 system 的长度和哈希 ========
+    const sysLen = JSON.stringify(body.system).length;
+    const sysDigest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(JSON.stringify(body.system))
+    );
+    const sysHash = [...new Uint8Array(sysDigest)]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+    console.log("DEBUG sysLen:", sysLen, "sysHash:", sysHash);
+    // ======== 调试日志结束 ========
+
     injectSystemCache(body);
     headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
   }
-
   let convertSse = false;
   if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
     body.stream = false;

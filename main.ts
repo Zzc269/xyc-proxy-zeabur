@@ -1,25 +1,54 @@
 /**
- * xyc relay - minimal stable system-breakpoint relay
- * Only puts a 1h cache breakpoint on the SYSTEM prompt (most stable part).
- * Does NOT touch messages, tools, or inject anything into the conversation,
- * so LobeHub chat-env config changes cannot break the cache prefix.
+ * xyc relay v3 — 1h nested prompt cache
+ * Deno / Zeabur 单文件
+ *
+ * 只做标准分段断点：
+ *   tools → 去掉时间后的 system → 稳定历史尾
+ * 把用户写在 system 里的
+ *   当前北京时间：YYYY-MM-DD HH:MM（Asia/Shanghai）
+ * 挪到最新 user 消息末尾，且不打 cache_control。
+ *
+ * LobeHub Anthropic Base URL: https://YOUR_PROJECT.zeabur.app
+ *
+ * 环境变量：
+ *   UPSTREAM_URL     默认 https://cn.chatapi.app
+ *   PROXY_TOKEN      可选；有则请求必须带 x-proxy-token
+ *   CACHE_TTL_ON     "0" = 不改 cache；默认开
+ *   FORCE_NON_STREAM "0" = 透传流式；默认强制非流式再转 SSE
+ *   DEBUG_CACHE      "1" = 打断点/时间剥离日志
+ *   PORT             默认 8000
  */
 
 const PROVIDER = "xyc";
 const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
+const MAX_BREAKPOINTS = 4;
+const MIN_CHARS = 2000;
+const TIME_RE =
+  /(?:^|\n)[ \t]*当前北京时间：\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\s*[（(]Asia\/Shanghai[）)][ \t]*/;
 
 // deno-lint-ignore no-explicit-any
 type Any = any;
 
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || DEFAULT_UPSTREAM).replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
+const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
+const DEBUG_CACHE = Deno.env.get("DEBUG_CACHE") === "1";
 const parsedPort = Number(Deno.env.get("PORT") || "8000");
 const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? Math.trunc(parsedPort) : 8000;
 
-const CORS_HEADERS = {
+const CACHEABLE = new Set([
+  "text",
+  "image",
+  "document",
+  "tool_use",
+  "tool_result",
+  "search_result",
+]);
+
+const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers":
@@ -28,89 +57,253 @@ const CORS_HEADERS = {
   "access-control-max-age": "86400",
 };
 
-const STRIP_HEADERS = [
-  "host", "connection", "content-length", "transfer-encoding", "keep-alive",
-  "upgrade", "expect", "accept-encoding", "x-proxy-token", "x-proxy-request-id",
-  "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+const STRIP = [
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "keep-alive",
+  "upgrade",
+  "expect",
+  "accept-encoding",
+  "x-proxy-token",
+  "x-proxy-request-id",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
 ];
 
 let sequence = 0;
 
-function isObj(v) { return typeof v === "object" && v !== null && !Array.isArray(v); }
+function isObj(v: unknown): v is Record<string, Any> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
 
-function json(data, status = 200, requestId = "") {
-  const headers = new Headers({ ...CORS_HEADERS, "content-type": "application/json; charset=utf-8" });
-  if (requestId) headers.set("x-proxy-request-id", requestId);
+function json(data: unknown, status = 200, id = ""): Response {
+  const headers = new Headers({ ...CORS, "content-type": "application/json; charset=utf-8" });
+  if (id) headers.set("x-proxy-request-id", id);
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-function requestId() {
-  const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-  return `${stamp}-${++sequence}-${crypto.randomUUID().slice(0, 8)}`;
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
 }
 
-async function readRequestBody(req) {
-  if (!req.body) return null;
-  return new Uint8Array(await req.arrayBuffer());
+function requestId(): string {
+  return `${new Date().toISOString().replace(/[-:.]/g, "")}-${++sequence}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
-function normalizePath(p) { return p.replace(/\/+$/, "") || "/"; }
-function isMessagesPath(p) { return p === "/v1/messages" || p === "/messages"; }
-function isChatPath(p) { return p === "/v1/chat/completions" || p === "/chat/completions"; }
-function resolveUpstream(p) { return UPSTREAM + p; }
+function normalizePath(p: string): string {
+  return p.replace(/\/+$/, "") || "/";
+}
 
-/**
- * THE core: put ONE 1h breakpoint on the LAST text block of `system`.
- * System prompt is the most stable part of the request across turns,
- * so the cache prefix stays byte-identical -> reliable hits.
- * Tools/messages are left completely untouched.
- */
-function injectSystemCache(body) {
-  if (body.system === undefined) return;
+function isMessages(p: string): boolean {
+  return p === "/v1/messages" || p === "/messages";
+}
 
-  // system may be a string or an array of blocks
-  let blocks;
+function isChat(p: string): boolean {
+  return p === "/v1/chat/completions" || p === "/chat/completions";
+}
+
+function cc() {
+  return { type: "ephemeral", ttl: TTL };
+}
+
+function approxChars(body: Any): number {
+  let n = 0;
+  const walk = (v: unknown) => {
+    if (typeof v === "string") n += v.length;
+    else if (Array.isArray(v)) for (const x of v) walk(x);
+    else if (isObj(v)) for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.system);
+  walk(body?.messages);
+  walk(body?.tools);
+  return n;
+}
+
+function holders(body: Any): Record<string, Any>[] {
+  const out: Record<string, Any>[] = [];
+  const walk = (v: unknown) => {
+    if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+      return;
+    }
+    if (!isObj(v)) return;
+    if (isObj(v.cache_control)) out.push(v);
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.system);
+  walk(body?.messages);
+  walk(body?.tools);
+  return out;
+}
+
+function stripCache(body: Any): void {
+  for (const h of holders(body)) delete h.cache_control;
+}
+
+function toBlocks(v: unknown): Record<string, Any>[] | null {
+  if (typeof v === "string") return v.trim() === "" ? null : [{ type: "text", text: v }];
+  if (Array.isArray(v)) {
+    const b = v.filter(isObj);
+    return b.length ? b : null;
+  }
+  return null;
+}
+
+function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | null {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (typeof blocks[i].type === "string" && CACHEABLE.has(blocks[i].type)) return blocks[i];
+  }
+  return null;
+}
+
+function extractTimeLine(text: string): { text: string; time: string | null } {
+  const m = text.match(TIME_RE);
+  if (!m) return { text, time: null };
+  const time = m[0].replace(/^\n/, "").trim();
+  let next = (text.slice(0, m.index) + text.slice((m.index ?? 0) + m[0].length)).replace(/\n{3,}/g, "\n\n");
+  if (next.startsWith("\n")) next = next.slice(1);
+  return { text: next, time };
+}
+
+/** 从 system 抠走「当前北京时间：…」，返回抽到的那一行。 */
+function extractTimeFromSystem(body: Any): string | null {
+  if (body.system === undefined) return null;
+  let found: string | null = null;
+
   if (typeof body.system === "string") {
-    if (body.system.trim() === "") return;
-    blocks = [{ type: "text", text: body.system }];
+    const r = extractTimeLine(body.system);
+    body.system = r.text;
+    found = r.time;
   } else if (Array.isArray(body.system)) {
-    blocks = body.system.filter(isObj);
-  } else {
+    for (const block of body.system) {
+      if (!isObj(block) || typeof block.text !== "string") continue;
+      const r = extractTimeLine(block.text);
+      if (r.time) {
+        block.text = r.text;
+        found = r.time;
+      }
+    }
+    body.system = body.system.filter((b: unknown) => {
+      if (!isObj(b)) return true;
+      if (b.type === "text" && typeof b.text === "string" && b.text.trim() === "") return false;
+      return true;
+    });
+  }
+  return found;
+}
+
+function appendTimeToLastUser(body: Any, timeLine: string): void {
+  if (!Array.isArray(body.messages) || !timeLine) return;
+
+  let lastUser: Record<string, Any> | null = null;
+  for (let i = body.messages.length - 1; i >= 0; i--) {
+    const msg = body.messages[i];
+    if (isObj(msg) && msg.role === "user") {
+      lastUser = msg;
+      break;
+    }
+  }
+  if (!lastUser) return;
+
+  if (typeof lastUser.content === "string") {
+    lastUser.content = lastUser.content.trim() === ""
+      ? [{ type: "text", text: timeLine }]
+      : [{ type: "text", text: lastUser.content }, { type: "text", text: timeLine }];
     return;
   }
-  if (blocks.length === 0) return;
-
-  // find last text block (or last block) and attach breakpoint
-  const last = blocks[blocks.length - 1];
-  last.cache_control = { type: "ephemeral", ttl: TTL };
-
-  // write back as array form (stable)
-  body.system = blocks;
+  if (!Array.isArray(lastUser.content)) {
+    lastUser.content = [{ type: "text", text: timeLine }];
+    return;
+  }
+  lastUser.content.push({ type: "text", text: timeLine });
 }
 
-function mergeBetaHeader(current) {
-  const parts = (current ?? "").split(",").map(s => s.trim()).filter(Boolean);
+function injectBreakpoints(body: Any): void {
+  stripCache(body);
+  if (approxChars(body) < MIN_CHARS) return;
+
+  let budget = MAX_BREAKPOINTS;
+  const mark = (h: Record<string, Any>) => {
+    if (budget <= 0 || isObj(h.cache_control)) return;
+    h.cache_control = cc();
+    budget--;
+  };
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tool = body.tools.filter(isObj).at(-1);
+    if (tool) mark(tool);
+  }
+
+  if (body.system !== undefined) {
+    const blocks = toBlocks(body.system);
+    const target = blocks && lastCacheable(blocks);
+    if (blocks && target) {
+      body.system = blocks;
+      mark(target);
+    }
+  }
+
+  if (Array.isArray(body.messages) && body.messages.length >= 2) {
+    let placed = 0;
+    for (let i = body.messages.length - 2; i >= 0 && placed < 2 && budget > 0; i--) {
+      const msg = body.messages[i];
+      if (!isObj(msg)) continue;
+      const blocks = toBlocks(msg.content);
+      const target = blocks && lastCacheable(blocks);
+      if (!blocks || !target || isObj(target.cache_control)) continue;
+      msg.content = blocks;
+      mark(target);
+      placed++;
+    }
+  }
+}
+
+function injectOpenAI(body: Any): void {
+  stripCache(body);
+  if (approxChars(body) < MIN_CHARS || !Array.isArray(body.messages)) return;
+  for (const msg of body.messages) {
+    if (!isObj(msg) || msg.role !== "system") continue;
+    if (Array.isArray(msg.content)) {
+      const t = lastCacheable(msg.content.filter(isObj));
+      if (t) t.cache_control = cc();
+    } else if (typeof msg.content === "string") {
+      msg.cache_control = cc();
+    }
+  }
+}
+
+function mergeBeta(current: string | null): string {
+  const parts = (current ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!parts.includes(BETA_FLAG)) parts.push(BETA_FLAG);
   return parts.join(",");
 }
 
-function responseHeaders(source, requestId) {
+function responseHeaders(source: Headers, id: string): Headers {
   const out = new Headers(source);
   out.delete("content-encoding");
   out.delete("content-length");
   out.delete("transfer-encoding");
   out.delete("connection");
-  for (const [k, v] of Object.entries(CORS_HEADERS)) out.set(k, v);
-  out.set("x-proxy-request-id", requestId);
+  for (const [k, v] of Object.entries(CORS)) out.set(k, v);
+  out.set("x-proxy-request-id", id);
   return out;
 }
 
-function sseFrame(event, data) { return `event: ${event}\ndata: ${JSON.stringify(data)}`; }
+function sseFrame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}`;
+}
 
-function toSse(text) {
-  let parsed;
-  try { parsed = JSON.parse(text); }
-  catch {
+function toSse(text: string): string {
+  let parsed: Any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
     return `${sseFrame("error", { type: "error", error: { type: "parse_error", message: text.slice(0, 500) } })}\n\n`;
   }
   if (!isObj(parsed)) {
@@ -120,25 +313,36 @@ function toSse(text) {
     return `${sseFrame("error", { type: "error", error: parsed.error })}\n\n`;
   }
 
-  const events = [];
+  const events: string[] = [];
   events.push(sseFrame("message_start", { type: "message_start", message: { ...parsed, content: [] } }));
 
   const blocks = Array.isArray(parsed.content) ? parsed.content : [];
-  blocks.forEach((block, index) => {
+  blocks.forEach((block: unknown, index: number) => {
     if (!isObj(block)) return;
-    const start = { type: "content_block_start", index, content_block: { ...block } };
+    const start: Any = { type: "content_block_start", index, content_block: { ...block } };
     if (block.type === "text") start.content_block.text = "";
     if (block.type === "tool_use") start.content_block.input = undefined;
     events.push(sseFrame("content_block_start", start));
 
     if (block.type === "text" && typeof block.text === "string") {
-      events.push(sseFrame("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } }));
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "text_delta", text: block.text },
+      }));
     } else if (block.type === "thinking" && typeof block.thinking === "string") {
-      events.push(sseFrame("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: block.thinking } }));
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking: block.thinking },
+      }));
     } else if (block.type === "tool_use") {
-      events.push(sseFrame("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input ?? {}) } }));
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input ?? {}) },
+      }));
     }
-
     events.push(sseFrame("content_block_stop", { type: "content_block_stop", index }));
   });
 
@@ -151,18 +355,27 @@ function toSse(text) {
   return events.join("\n\n") + "\n\n";
 }
 
-async function forwardOnce(method, target, headers, body, meta) {
-  let upstream;
+async function forwardOnce(
+  method: string,
+  target: string,
+  headers: Headers,
+  body: BodyInit | null,
+  meta: { id: string; convertSse?: boolean },
+): Promise<Response> {
+  let upstream: Response;
   try {
     upstream = await fetch(target, { method, headers, body });
-  } catch (error) {
-    return json({ error: `upstream error: ${error.message}` }, 502, meta.id);
+  } catch (e) {
+    return json({ error: `upstream error: ${e instanceof Error ? e.message : String(e)}` }, 502, meta.id);
   }
 
   if (meta.convertSse) {
-    let text;
-    try { text = await new Response(upstream.body).text(); }
-    catch (error) { return json({ error: `upstream read error: ${error.message}` }, 502, meta.id); }
+    let text = "";
+    try {
+      text = await new Response(upstream.body).text();
+    } catch (e) {
+      return json({ error: `upstream read error: ${e instanceof Error ? e.message : String(e)}` }, 502, meta.id);
+    }
     const out = responseHeaders(upstream.headers, meta.id);
     out.set("content-type", "text/event-stream; charset=utf-8");
     return new Response(toSse(text), { status: upstream.status, headers: out });
@@ -172,69 +385,84 @@ async function forwardOnce(method, target, headers, body, meta) {
   return new Response(upstream.body, { status: upstream.status, headers: out });
 }
 
-async function handler(req) {
+async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = normalizePath(url.pathname);
 
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
   if (PROXY_TOKEN) {
     const supplied = req.headers.get("x-proxy-token") || url.searchParams.get("proxy_token") || "";
-    if (supplied !== PROXY_TOKEN) return json({ error: "unauthorized" }, 401);
+    if (!safeEqual(supplied, PROXY_TOKEN)) return json({ error: "unauthorized" }, 401);
   }
   url.searchParams.delete("proxy_token");
 
   if (req.method === "GET" && (path === "/" || path === "/health")) {
-    return json({ ok: true, provider: PROVIDER, upstream: UPSTREAM, cache: "1h/system", beta: BETA_FLAG, forceNonStream: FORCE_NON_STREAM });
+    return json({
+      ok: true,
+      provider: PROVIDER,
+      upstream: UPSTREAM,
+      cache: CACHE_ENABLED ? "1h/tools+system+history" : "passthrough",
+      beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
+      timeRelocate: "当前北京时间：…（Asia/Shanghai） out of system, after breakpoints",
+      forceNonStream: FORCE_NON_STREAM,
+    });
   }
 
   const id = requestId();
-  const target = resolveUpstream(path) + url.search;
+  const target = UPSTREAM + path + url.search;
   const headers = new Headers(req.headers);
-  for (const h of STRIP_HEADERS) headers.delete(h);
+  for (const h of STRIP) headers.delete(h);
   headers.set("x-proxy-request-id", id);
 
-  let inboundBytes;
-  try { inboundBytes = await readRequestBody(req); }
-  catch (error) { return json({ error: `request body read error: ${error.message}` }, 400, id); }
-
-  const rewriteable = req.method === "POST" && (isMessagesPath(path) || isChatPath(path));
-  if (!rewriteable) {
-    return await forwardOnce(req.method, target, headers, inboundBytes ? new Uint8Array(inboundBytes).buffer : null, { id });
+  let inbound: Uint8Array | null;
+  try {
+    inbound = req.body ? new Uint8Array(await req.arrayBuffer()) : null;
+  } catch (e) {
+    return json({ error: `request body read error: ${e instanceof Error ? e.message : String(e)}` }, 400, id);
   }
 
-  let body;
-  try { body = JSON.parse(new TextDecoder().decode(inboundBytes ?? new Uint8Array())); }
-  catch { return json({ error: "bad json body" }, 400, id); }
-
-  if (isMessagesPath(path)) {
-    const sysLen = JSON.stringify(body.system).length;
-    const sysDigest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(JSON.stringify(body.system))
-    );
-    const sysHash = [...new Uint8Array(sysDigest)]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("")
-      .slice(0, 16);
-    console.log("DEBUG sysLen:", sysLen, "sysHash:", sysHash);
-
-    console.log("DEBUG sysHEAD:", JSON.stringify(body.system).slice(0, 100));   // ← 新增
-    console.log("DEBUG sysTAIL:", JSON.stringify(body.system).slice(-200));     // ← 新增
-
-    injectSystemCache(body);
-    headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
+  const rewrite = req.method === "POST" && (isMessages(path) || isChat(path));
+  if (!rewrite) {
+    return await forwardOnce(req.method, target, headers, inbound ? inbound.buffer : null, { id });
   }
+
+  let body: Any;
+  try {
+    body = JSON.parse(new TextDecoder().decode(inbound ?? new Uint8Array()));
+  } catch {
+    return json({ error: "bad json body" }, 400, id);
+  }
+
+  if (CACHE_ENABLED && isMessages(path)) {
+    const timeLine = extractTimeFromSystem(body);
+    injectBreakpoints(body);
+    if (timeLine) appendTimeToLastUser(body, timeLine);
+    headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
+
+    if (DEBUG_CACHE) {
+      console.log("DEBUG timeRelocated:", Boolean(timeLine), timeLine ?? "");
+      console.log("DEBUG breakpoints:", holders(body).length);
+      console.log("DEBUG sysHasTime:", JSON.stringify(body.system ?? "").includes("当前北京时间"));
+    }
+  } else if (CACHE_ENABLED && isChat(path)) {
+    injectOpenAI(body);
+  }
+
   let convertSse = false;
-  if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
+  if (FORCE_NON_STREAM && isMessages(path) && body?.stream === true) {
     body.stream = false;
     convertSse = true;
   }
 
   headers.set("content-type", "application/json");
-  const outboundBytes = new TextEncoder().encode(JSON.stringify(body));
-
-  return await forwardOnce("POST", target, headers, outboundBytes, { id, convertSse });
+  return await forwardOnce(
+    "POST",
+    target,
+    headers,
+    new TextEncoder().encode(JSON.stringify(body)),
+    { id, convertSse },
+  );
 }
 
 Deno.serve({ port: PORT, onListen: () => {} }, handler);

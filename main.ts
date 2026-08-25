@@ -200,28 +200,10 @@ function extractTimeFromSystem(body: Any): string | null {
 
 function appendTimeToLastUser(body: Any, timeLine: string): void {
   if (!Array.isArray(body.messages) || !timeLine) return;
-
-  let lastUser: Record<string, Any> | null = null;
-  for (let i = body.messages.length - 1; i >= 0; i--) {
-    const msg = body.messages[i];
-    if (isObj(msg) && msg.role === "user") {
-      lastUser = msg;
-      break;
-    }
-  }
-  if (!lastUser) return;
-
-  if (typeof lastUser.content === "string") {
-    lastUser.content = lastUser.content.trim() === ""
-      ? [{ type: "text", text: timeLine }]
-      : [{ type: "text", text: lastUser.content }, { type: "text", text: timeLine }];
-    return;
-  }
-  if (!Array.isArray(lastUser.content)) {
-    lastUser.content = [{ type: "text", text: timeLine }];
-    return;
-  }
-  lastUser.content.push({ type: "text", text: timeLine });
+  body.messages.push({
+    role: "user",
+    content: [{ type: "text", text: timeLine }],
+  });
 }
 
 function injectBreakpoints(body: Any): void {

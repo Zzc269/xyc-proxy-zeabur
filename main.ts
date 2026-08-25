@@ -13,7 +13,7 @@
  *                     + prefix >= ~1024 tokens
  *
  * Design for stable hits:
- *   - Breakpoints placed on system / tools / stable history tail (multi-breakpoint)
+ *   - Breakpoints on system / tools / stable history tail (multi-breakpoint)
  *   - No current-time injection (removed entirely)
  *   - No message reordering (keeps tool_result order stable across turns)
  *   - Force non-stream by default, convert full JSON back to SSE
@@ -24,7 +24,7 @@ const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 const MAX_BREAKPOINTS = 4;
-const MIN_PREFIX_TOKENS_EST = 2048; // safety margin over ~1024 token requirement
+const MIN_PREFIX_TOKENS_EST = 2048;
 const CACHEABLE_TYPES = new Set([
   "text",
   "image",
@@ -177,14 +177,7 @@ function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | nul
   return null;
 }
 
-/**
- * Multi-breakpoint injection: upgrade any existing breakpoints to 1h, then
- * top up tools / system / tail messages up to MAX_BREAKPOINTS.
- * Key: breakpoints go on STABLE parts (tools, system, history tail) — NOT on
- * the newest user message — so the prefix stays byte-identical between turns.
- */
 function injectAnthropicAll(body: Any, tailBreakpoints: number): void {
-  // 1. Normalize all existing cache_control to our TTL
   const holders = existingHolders(body);
   for (const holder of holders) {
     const old = holder.cache_control;
@@ -205,13 +198,11 @@ function injectAnthropicAll(body: Any, tailBreakpoints: number): void {
     }
   };
 
-  // tools tail
   if (budget > 0 && Array.isArray(body.tools) && body.tools.length > 0) {
     const tool = body.tools.filter(isObj).at(-1);
     if (tool) mark(tool);
   }
 
-  // system tail
   if (budget > 0 && body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);
@@ -221,11 +212,8 @@ function injectAnthropicAll(body: Any, tailBreakpoints: number): void {
     }
   }
 
-  // tail messages (stable history tail, skip newest if it is the changing one)
   if (budget > 0 && tailBreakpoints > 0 && Array.isArray(body.messages)) {
     let placed = 0;
-    // Start from second-to-last so the newest user msg (which changes) is not
-    // a breakpoint; if fewer messages, fall back to scanning from end.
     const start = body.messages.length - 2;
     for (
       let i = Math.max(start, 0);
@@ -408,4 +396,55 @@ async function handler(req: Request): Promise<Response> {
       cache: CACHE_ENABLED ? `1h/multi` : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
       forceNonStream: FORCE_NON_STREAM,
-      upstreamAttemptsPer
+      upstreamAttemptsPerIncomingRequest: 1,
+    });
+  }
+
+  const id = requestId();
+  const target = resolveUpstream(path) + url.search;
+  const headers = new Headers(req.headers);
+  for (const header of STRIP_HEADERS) headers.delete(header);
+  headers.set("x-proxy-request-id", id);
+
+  let inboundBytes: Uint8Array | null;
+  try {
+    inboundBytes = await readRequestBody(req);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return json({ error: `request body read error: ${message}` }, 400, id);
+  }
+
+  const rewriteable = req.method === "POST" && (isMessagesPath(path) || isChatPath(path));
+  if (!rewriteable) {
+    return await forwardOnce(req.method, target, headers, requestBodyInit(inboundBytes), { id });
+  }
+
+  let body: Any;
+  try {
+    body = JSON.parse(new TextDecoder().decode(inboundBytes ?? new Uint8Array()));
+  } catch {
+    return json({ error: "bad json body" }, 400, id);
+  }
+
+  if (CACHE_ENABLED) {
+    if (isMessagesPath(path)) {
+      injectAnthropicAll(body, 2);
+      headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
+    } else {
+      injectOpenAI(body);
+    }
+  }
+
+  let convertSse = false;
+  if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
+    body.stream = false;
+    convertSse = true;
+  }
+
+  headers.set("content-type", "application/json");
+  const outboundBytes = new TextEncoder().encode(JSON.stringify(body));
+
+  return await forwardOnce("POST", target, headers, outboundBytes, { id, convertSse });
+}
+
+Deno.serve({ port: PORT, onListen: () => {} }, handler);

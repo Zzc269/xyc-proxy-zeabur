@@ -207,9 +207,7 @@ async function handler(req) {
   try { body = JSON.parse(new TextDecoder().decode(inboundBytes ?? new Uint8Array())); }
   catch { return json({ error: "bad json body" }, 400, id); }
 
-  // Only inject on the system prompt — the most stable part.
   if (isMessagesPath(path)) {
-    // ======== 新增调试日志：打印 system 的长度和哈希 ========
     const sysLen = JSON.stringify(body.system).length;
     const sysDigest = await crypto.subtle.digest(
       "SHA-256",
@@ -220,7 +218,9 @@ async function handler(req) {
       .join("")
       .slice(0, 16);
     console.log("DEBUG sysLen:", sysLen, "sysHash:", sysHash);
-    // ======== 调试日志结束 ========
+
+    console.log("DEBUG sysHEAD:", JSON.stringify(body.system).slice(0, 100));   // ← 新增
+    console.log("DEBUG sysTAIL:", JSON.stringify(body.system).slice(-200));     // ← 新增
 
     injectSystemCache(body);
     headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));

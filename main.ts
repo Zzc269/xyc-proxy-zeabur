@@ -45,8 +45,9 @@ type Any = any;
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || DEFAULT_UPSTREAM).replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
-const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "message").toLowerCase();
-const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
+const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "all").toLowerCase();
+const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "1";
+
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
 const parsedPort = Number(Deno.env.get("PORT") || "8000");

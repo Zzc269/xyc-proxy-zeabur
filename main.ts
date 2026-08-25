@@ -1,22 +1,21 @@
 /**
- * xyc relay v3 — 1h nested prompt cache
+ * xyc relay v4 — Claude 1h nested cache + runtime time after breakpoints
  * Deno / Zeabur 单文件
  *
- * 只做标准分段断点：
- *   tools → 去掉时间后的 system → 稳定历史尾
- * 把用户写在 system 里的
- *   当前北京时间：YYYY-MM-DD HH:MM（Asia/Shanghai）
- * 挪到最新 user 消息末尾，且不打 cache_control。
+ * 默认透传流式。FORCE_NON_STREAM=1 才改成非流式再转 SSE。
  *
- * LobeHub Anthropic Base URL: https://YOUR_PROJECT.zeabur.app
+ * 缓存：tools → 去掉时间后的 system → 稳定历史尾（最多 4 个 1h 断点）
+ * 时间：代理生成，永远是最后一条 user，不带 cache_control
  *
  * 环境变量：
- *   UPSTREAM_URL     默认 https://cn.chatapi.app
- *   PROXY_TOKEN      可选；有则请求必须带 x-proxy-token
- *   CACHE_TTL_ON     "0" = 不改 cache；默认开
- *   FORCE_NON_STREAM "0" = 透传流式；默认强制非流式再转 SSE
- *   DEBUG_CACHE      "1" = 打断点/时间剥离日志
- *   PORT             默认 8000
+ *   UPSTREAM_URL        默认 https://cn.chatapi.app
+ *   PROXY_TOKEN         可选；有则请求必须带 x-proxy-token
+ *   CACHE_TTL_ON        "0" = 不改 cache；默认开
+ *   INJECT_CURRENT_TIME "0" = 不注入时间；默认开
+ *   TIME_ZONE           默认 Asia/Shanghai
+ *   FORCE_NON_STREAM    "1" = 强制非流式 + SSE；默认关（透传流式）
+ *   DEBUG_CACHE         "1" = 打日志
+ *   PORT                默认 8000
  */
 
 const PROVIDER = "xyc";
@@ -25,7 +24,8 @@ const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 const MAX_BREAKPOINTS = 4;
 const MIN_CHARS = 2000;
-const TIME_RE =
+const RUNTIME_MARKER = "xyc-proxy-runtime-time-v2";
+const TIME_LINE_RE =
   /(?:^|\n)[ \t]*当前北京时间：\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\s*[（(]Asia\/Shanghai[）)][ \t]*/;
 
 // deno-lint-ignore no-explicit-any
@@ -34,7 +34,9 @@ type Any = any;
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || DEFAULT_UPSTREAM).replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
-const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
+const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
+const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
+const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") === "1";
 const DEBUG_CACHE = Deno.env.get("DEBUG_CACHE") === "1";
 const parsedPort = Number(Deno.env.get("PORT") || "8000");
 const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? Math.trunc(parsedPort) : 8000;
@@ -112,6 +114,22 @@ function cc() {
   return { type: "ephemeral", ttl: TTL };
 }
 
+function formatTime(date = new Date()): string {
+  try {
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(date);
+  } catch {
+    return date.toISOString();
+  }
+}
+
 function approxChars(body: Any): number {
   let n = 0;
   const walk = (v: unknown) => {
@@ -162,31 +180,26 @@ function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | nul
   return null;
 }
 
-function extractTimeLine(text: string): { text: string; time: string | null } {
-  const m = text.match(TIME_RE);
-  if (!m) return { text, time: null };
-  const time = m[0].replace(/^\n/, "").trim();
+function extractTimeLine(text: string): string {
+  const m = text.match(TIME_LINE_RE);
+  if (!m) return text;
   let next = (text.slice(0, m.index) + text.slice((m.index ?? 0) + m[0].length)).replace(/\n{3,}/g, "\n\n");
   if (next.startsWith("\n")) next = next.slice(1);
-  return { text: next, time };
+  return next;
 }
 
-/** 从 system 抠走「当前北京时间：…」，返回抽到的那一行。 */
-function extractTimeFromSystem(body: Any): string | null {
-  if (body.system === undefined) return null;
-  let found: string | null = null;
+function isRuntimeTimeText(text: string): boolean {
+  return text.includes(RUNTIME_MARKER) || TIME_LINE_RE.test(`\n${text}`);
+}
 
+/** 清掉提示词/历史里旧的北京时间，以及代理上一轮追加的时间消息 */
+function stripOldTime(body: Any): void {
   if (typeof body.system === "string") {
-    const r = extractTimeLine(body.system);
-    body.system = r.text;
-    found = r.time;
+    body.system = extractTimeLine(body.system);
   } else if (Array.isArray(body.system)) {
     for (const block of body.system) {
-      if (!isObj(block) || typeof block.text !== "string") continue;
-      const r = extractTimeLine(block.text);
-      if (r.time) {
-        block.text = r.text;
-        found = r.time;
+      if (isObj(block) && typeof block.text === "string") {
+        block.text = extractTimeLine(block.text);
       }
     }
     body.system = body.system.filter((b: unknown) => {
@@ -195,15 +208,38 @@ function extractTimeFromSystem(body: Any): string | null {
       return true;
     });
   }
-  return found;
+
+  if (!Array.isArray(body.messages)) return;
+  body.messages = body.messages.filter((msg: unknown) => {
+    if (!isObj(msg)) return true;
+
+    if (typeof msg.content === "string") {
+      if (msg.content.includes(RUNTIME_MARKER)) return false;
+      msg.content = extractTimeLine(msg.content);
+      return msg.content.trim() !== "";
+    }
+
+    if (!Array.isArray(msg.content)) return true;
+    msg.content = msg.content.filter((block: unknown) => {
+      if (!isObj(block) || typeof block.text !== "string") return true;
+      if (block.text.includes(RUNTIME_MARKER)) return false;
+      block.text = extractTimeLine(block.text);
+      if (block.type === "text" && block.text.trim() === "") return false;
+      return true;
+    });
+    return msg.content.length > 0;
+  });
 }
 
-function appendTimeToLastUser(body: Any, timeLine: string): void {
-  if (!Array.isArray(body.messages) || !timeLine) return;
-  body.messages.push({
-    role: "user",
-    content: [{ type: "text", text: timeLine }],
-  });
+function normalizeAnthropicMessages(body: Any): void {
+  if (!Array.isArray(body?.messages)) return;
+  for (const msg of body.messages) {
+    if (!isObj(msg)) continue;
+    if (typeof msg.content === "string") {
+      if (msg.content.trim() === "") continue;
+      msg.content = [{ type: "text", text: msg.content }];
+    }
+  }
 }
 
 function injectBreakpoints(body: Any): void {
@@ -231,9 +267,9 @@ function injectBreakpoints(body: Any): void {
     }
   }
 
-  if (Array.isArray(body.messages) && body.messages.length >= 2) {
+  if (Array.isArray(body.messages) && body.messages.length > 0) {
     let placed = 0;
-    for (let i = body.messages.length - 2; i >= 0 && placed < 2 && budget > 0; i--) {
+    for (let i = body.messages.length - 1; i >= 0 && placed < 2 && budget > 0; i--) {
       const msg = body.messages[i];
       if (!isObj(msg)) continue;
       const blocks = toBlocks(msg.content);
@@ -244,6 +280,17 @@ function injectBreakpoints(body: Any): void {
       placed++;
     }
   }
+}
+
+function appendRuntimeTime(body: Any): void {
+  if (!Array.isArray(body.messages)) body.messages = [];
+  const line =
+    `<!-- ${RUNTIME_MARKER} -->\n` +
+    `当前北京时间：${formatTime()}（${TIME_ZONE}）`;
+  body.messages.push({
+    role: "user",
+    content: [{ type: "text", text: line }],
+  });
 }
 
 function injectOpenAI(body: Any): void {
@@ -386,8 +433,10 @@ async function handler(req: Request): Promise<Response> {
       upstream: UPSTREAM,
       cache: CACHE_ENABLED ? "1h/tools+system+history" : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
-      timeRelocate: "当前北京时间：…（Asia/Shanghai） out of system, after breakpoints",
+      timeInjection: TIME_ENABLED ? "last-user-after-breakpoints" : "off",
+      timeZone: TIME_ZONE,
       forceNonStream: FORCE_NON_STREAM,
+      stream: FORCE_NON_STREAM ? "buffered-sse" : "passthrough",
     });
   }
 
@@ -417,15 +466,19 @@ async function handler(req: Request): Promise<Response> {
   }
 
   if (CACHE_ENABLED && isMessages(path)) {
-    const timeLine = extractTimeFromSystem(body);
+    stripOldTime(body);
+    normalizeAnthropicMessages(body);
     injectBreakpoints(body);
-    if (timeLine) appendTimeToLastUser(body, timeLine);
+    if (TIME_ENABLED) appendRuntimeTime(body);
     headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
 
     if (DEBUG_CACHE) {
-      console.log("DEBUG timeRelocated:", Boolean(timeLine), timeLine ?? "");
+      const last = body.messages?.at?.(-1);
       console.log("DEBUG breakpoints:", holders(body).length);
+      console.log("DEBUG lastRole:", last?.role);
+      console.log("DEBUG lastIsTime:", JSON.stringify(last ?? "").includes(RUNTIME_MARKER));
       console.log("DEBUG sysHasTime:", JSON.stringify(body.system ?? "").includes("当前北京时间"));
+      console.log("DEBUG stream:", body?.stream === true);
     }
   } else if (CACHE_ENABLED && isChat(path)) {
     injectOpenAI(body);

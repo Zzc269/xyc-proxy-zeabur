@@ -1172,7 +1172,7 @@ async function handler(req: Request): Promise<Response> {
     ? new TextEncoder().encode(JSON.stringify(body))
     : (inbound ?? new Uint8Array());
   if (KEEPALIVE_ENABLED && isMessages(path) && msgsExact && msgsExact.length > 0) {
-    registerKeepalive(outboundBytes, target, headers, rec.sysHash, rec.toolsHash, msgsExact);
+    registerKeepalive(outboundBytes, target, headers, rec.sysHash, rec.toolsHash, msgsCanon);
   }
   headers.set("content-type", "application/json");
   return await forwardOnce("POST", target, headers, outboundBytes as unknown as BodyInit, rec, rec.convertSse);

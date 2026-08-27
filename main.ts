@@ -859,7 +859,8 @@ interface KeepaliveEntry {
   key: string;
   sysHash: string;
   msgsExact: string[];
-  lastReal: number;
+  lastReal: number; // 最后一次真实用户请求时间（保活不能改它）
+  nextKa: number;   // 下次保活计划时刻（精确调度，避免边界漏拍）
   target: string;
   headers: Headers;
   body: Uint8Array;
@@ -893,11 +894,12 @@ function registerKeepalive(
       e.headers = headers;
       e.msgsExact = msgsExact;
       e.lastReal = Date.now();
+      e.nextKa = Date.now() + KEEP_INTERVAL_MS;
       return;
     }
   }
   const key = keepaliveKey(sysHash, toolsHash, msgsExact);
-  keepalives.set(key, { key, sysHash, msgsExact, lastReal: Date.now(), target, headers, body: outbound });
+  keepalives.set(key, { key, sysHash, msgsExact, lastReal: Date.now(), nextKa: Date.now() + KEEP_INTERVAL_MS, target, headers, body: outbound });
   if (keepalives.size > 20) {
     const oldest = [...keepalives.values()].sort((a, b) => a.lastReal - b.lastReal)[0];
     if (oldest) keepalives.delete(oldest.key);
@@ -925,7 +927,7 @@ async function runKeepalive(): Promise<void> {
       console.log(`[keepalive] drop ${e.key} (idle ${Math.round(idle / 60000)}m)`);
       continue;
     }
-    if (idle < KEEP_INTERVAL_MS) continue;
+    if (now < e.nextKa) continue; // 未到保活时刻，精确调度
     try {
       const body = keepaliveBodyOf(e.body);
       const headers = new Headers(e.headers);
@@ -957,7 +959,7 @@ async function runKeepalive(): Promise<void> {
       };
       pushLog(krec);
       console.log(`[keepalive] ${e.key} status=${resp.status} read=${read} idle=${Math.round(idle / 60000)}m`);
-      e.lastReal = Date.now();
+      e.nextKa = Date.now() + KEEP_INTERVAL_MS;
     } catch (err) {
       const erec: LogRec = {
         ts: clock(), id: requestId(), method: "POST", path: "/keepalive",
@@ -980,7 +982,7 @@ async function runKeepalive(): Promise<void> {
 }
 
 if (KEEPALIVE_ENABLED) {
-  setInterval(() => { void runKeepalive(); }, KEEP_INTERVAL_MS);
+  setInterval(() => { void runKeepalive(); }, Math.min(KEEP_INTERVAL_MS, 60_000));
   console.log(`[keepalive] enabled (interval=${KEEP_INTERVAL_MS / 60000}m idle=${KEEP_IDLE_MS / 60000}m)`);
 }
 

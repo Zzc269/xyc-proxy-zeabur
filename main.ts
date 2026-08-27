@@ -25,10 +25,13 @@
  *   LOG_BODY            "0" = 不记改写后请求体；默认记（图片/超长文本会裁）
  *   DEBUG               "1" = 成功请求也打 console，且请求体文本裁得更长
  *   PORT                Zeabur 注入；本地默认 8080
+ *
+ * v7: 前缀稳定性按 system 分组统计 —— canon(语义) / exact(字节) 双维度、
+ *     commonMsgPrefix / firstDiffMsg 精确定位漂移消息；保留 v5 全部修复。
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v5-diag";
+const VERSION = "v7-diag";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -118,6 +121,13 @@ interface LogRec {
   msgHashes: string;
   prefixHash: string;
   samePrefixAsPrev: boolean | null;
+  hasPrev: boolean | null;
+  sameToolsAsPrev: boolean | null;
+  msgHashesCanon: string;
+  commonMsgPrefix: number;
+  firstDiffMsg: number;
+  prefixStableCanon: boolean | null;
+  prefixStableExact: boolean | null;
   hasXApiKey: boolean;
   hasAuthorization: boolean;
   status?: number;
@@ -132,6 +142,8 @@ interface LogRec {
 const LOGS: LogRec[] = [];
 let sequence = 0;
 let lastPrefixHash: string | null = null;
+// Per-system (≈ per-agent conversation) last-seen state for prefix-stability.
+const lastBySystem = new Map<string, { toolsHash: string; msgsExact: string[]; msgsCanon: string[] }>();
 
 function isObj(v: unknown): v is Record<string, Any> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -220,6 +232,8 @@ function formatLog(rec: LogRec): string {
     `  sysHash=${rec.sysHash} toolsHash=${rec.toolsHash}`,
     `  msgHashes=${rec.msgHashes}`,
     `  prefixHash=${rec.prefixHash} samePrefixAsPrev=${rec.samePrefixAsPrev}`,
+    `  stability hasPrev=${rec.hasPrev} sameTools=${rec.sameToolsAsPrev} commonMsgPrefix=${rec.commonMsgPrefix} firstDiffMsg=${rec.firstDiffMsg}`,
+    `  prefixStable canon=${rec.prefixStableCanon} exact=${rec.prefixStableExact} msgHashesCanon=${rec.msgHashesCanon}`,
   ];
   if (rec.status !== undefined) {
     lines.push(`  status=${rec.status} ms=${rec.ms ?? "-"} respLen=${rec.respLen ?? "-"} ${usageLine(rec)}`);
@@ -276,12 +290,42 @@ function diagnosticHash(v: unknown): string {
   return shortHash(diagnosticValue(v));
 }
 
+function diagnosticValueCanon(v: unknown): unknown {
+  if (Array.isArray(v)) {
+    return v
+      .filter((item) =>
+        !(isObj(item) && item.type === "text" && typeof item.text === "string" && isRuntimeText(item.text))
+      )
+      .map(diagnosticValueCanon);
+  }
+  if (!isObj(v)) return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v).sort()) {
+    if (k === "cache_control") continue;
+    out[k] = diagnosticValueCanon(v[k]);
+  }
+  return out;
+}
+
+function diagnosticHashCanon(v: unknown): string {
+  return shortHash(diagnosticValueCanon(v));
+}
+
 function messageHashes(body: Any): string {
   if (!Array.isArray(body?.messages)) return "-";
   return body.messages.map((msg: unknown, i: number) => {
     if (!isObj(msg)) return `${i}?:invalid`;
     const role = String(msg.role ?? "?").slice(0, 1);
     return `${i}${role}:${diagnosticHash(msg.content)}`;
+  }).join(",");
+}
+
+function messageHashesCanon(body: Any): string {
+  if (!Array.isArray(body?.messages)) return "-";
+  return body.messages.map((msg: unknown, i: number) => {
+    if (!isObj(msg)) return `${i}?:invalid`;
+    const role = String(msg.role ?? "?").slice(0, 1);
+    return `${i}${role}:${diagnosticHashCanon(msg.content)}`;
   }).join(",");
 }
 
@@ -754,12 +798,13 @@ async function handler(req: Request): Promise<Response> {
   }
 
   if (req.method === "GET" && path === "/logs.json") {
-    return json({ count: LOGS.length, lastPrefixHash, logs: LOGS });
+    return json({ count: LOGS.length, lastPrefixHash, distinctSystems: lastBySystem.size, logs: LOGS });
   }
 
   if ((req.method === "GET" || req.method === "POST") && path === "/logs/clear") {
     LOGS.length = 0;
     lastPrefixHash = null;
+    lastBySystem.clear();
     return new Response("Logs cleared.", { headers: { ...CORS, "content-type": "text/plain; charset=utf-8" } });
   }
 
@@ -793,6 +838,13 @@ async function handler(req: Request): Promise<Response> {
     msgHashes: "-",
     prefixHash: "-",
     samePrefixAsPrev: null,
+    hasPrev: null,
+    sameToolsAsPrev: null,
+    msgHashesCanon: "-",
+    commonMsgPrefix: 0,
+    firstDiffMsg: -1,
+    prefixStableCanon: null,
+    prefixStableExact: null,
     hasXApiKey: Boolean(req.headers.get("x-api-key")),
     hasAuthorization: Boolean(req.headers.get("authorization")),
   };
@@ -810,7 +862,7 @@ async function handler(req: Request): Promise<Response> {
   const rewrite = req.method === "POST" && (isMessages(path) || isChat(path));
   if (!rewrite) {
     rec.outboundBeta = headers.get("anthropic-beta") ?? rec.inboundBeta;
-    return await forwardOnce(req.method, target, headers, inbound, rec, false);
+    return await forwardOnce(req.method, target, headers, inbound as BodyInit, rec, false);
   }
 
   let body: Any;
@@ -853,9 +905,38 @@ async function handler(req: Request): Promise<Response> {
   rec.sysHash = diagnosticHash(body?.system ?? null);
   rec.toolsHash = diagnosticHash(body?.tools ?? null);
   rec.msgHashes = messageHashes(body);
+  rec.msgHashesCanon = messageHashesCanon(body);
   rec.prefixHash = prefixHashOf(body);
-  rec.samePrefixAsPrev = lastPrefixHash === null ? null : lastPrefixHash === rec.prefixHash;
-  lastPrefixHash = rec.prefixHash;
+  const msgsExact = (body.messages ?? []).map((m: unknown, i: number) =>
+    isObj(m) ? diagnosticHash(m.content) : `?${i}`
+  );
+  const msgsCanon = (body.messages ?? []).map((m: unknown, i: number) =>
+    isObj(m) ? diagnosticHashCanon(m.content) : `?${i}`
+  );
+  const prevSys = lastBySystem.get(rec.sysHash);
+  if (prevSys) {
+    rec.hasPrev = true;
+    rec.sameToolsAsPrev = prevSys.toolsHash === rec.toolsHash;
+    const minLen = Math.min(prevSys.msgsExact.length, msgsExact.length);
+    let commonExact = 0;
+    while (commonExact < minLen && prevSys.msgsExact[commonExact] === msgsExact[commonExact]) commonExact++;
+    let commonCanon = 0;
+    while (commonCanon < minLen && prevSys.msgsCanon[commonCanon] === msgsCanon[commonCanon]) commonCanon++;
+    rec.commonMsgPrefix = commonCanon;
+    rec.firstDiffMsg = commonCanon < minLen ? commonCanon : -1;
+    rec.prefixStableCanon = prevSys.msgsCanon.length > 0 && commonCanon >= prevSys.msgsCanon.length && rec.sameToolsAsPrev;
+    rec.prefixStableExact = prevSys.msgsExact.length > 0 && commonExact >= prevSys.msgsExact.length && rec.sameToolsAsPrev;
+  } else {
+    rec.hasPrev = false;
+    rec.sameToolsAsPrev = null;
+    rec.commonMsgPrefix = 0;
+    rec.firstDiffMsg = -1;
+    rec.prefixStableCanon = null;
+    rec.prefixStableExact = null;
+  }
+  lastBySystem.set(rec.sysHash, { toolsHash: rec.toolsHash, msgsExact, msgsCanon });
+  rec.samePrefixAsPrev = rec.prefixStableExact;
+  lastPrefixHash = rec.prefixHash; // display only
   rec.chars = approxChars(body);
   rec.roles = rolesOf(body);
   rec.tools = Array.isArray(body?.tools) ? body.tools.length : 0;

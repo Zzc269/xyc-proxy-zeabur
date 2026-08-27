@@ -32,9 +32,9 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-bp3";
+const VERSION = "v7-kep";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
-const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "1h").toLowerCase() === "1h" ? "1h" : "5m";
+const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "5m").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
 const BETA_FLAG = TTL === "1h" ? "extended-cache-ttl-2025-04-11" : "";
 const MAX_BREAKPOINTS = 4;
@@ -838,6 +838,120 @@ function rebuildBody(parsed: Any): { body: Any; dropped: string[] } {
   return { body: out, dropped };
 }
 
+// ================================================================
+// Keepalive: 原生 5m 缓存的"人工续期"——每 KEEP_INTERVAL 分钟，
+// 对每个仍活跃（KEEP_IDLE 内）的会话重放其最后一次真实请求
+// （max_tokens=1、非流式、去 thinking），命中缓存读取即免费刷新寿命。
+// 按会话内容指纹（sysHash+toolsHash+msgsExact）隔离，换对话各保各的。
+// 环境变量: KEEPALIVE=1 启用; KEEP_INTERVAL 默认 4(分钟); KEEP_IDLE 默认 60(分钟)
+// ================================================================
+const KEEPALIVE_ENABLED = Deno.env.get("KEEPALIVE") === "1";
+const KEEP_INTERVAL_MS = (() => {
+  const n = Number(Deno.env.get("KEEP_INTERVAL") ?? "4");
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 60_000) : 4 * 60_000;
+})();
+const KEEP_IDLE_MS = (() => {
+  const n = Number(Deno.env.get("KEEP_IDLE") ?? "60");
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 60_000) : 60 * 60_000;
+})();
+
+interface KeepaliveEntry {
+  key: string;
+  sysHash: string;
+  msgsExact: string[];
+  lastReal: number;
+  target: string;
+  headers: Headers;
+  body: Uint8Array;
+}
+const keepalives = new Map<string, KeepaliveEntry>();
+
+function keepaliveKey(sysHash: string, toolsHash: string, msgsExact: string[]): string {
+  return `${sysHash}|${toolsHash}|${msgsExact.length}:${msgsExact.slice(-4).join(",")}`;
+}
+
+function registerKeepalive(
+  outbound: Uint8Array,
+  target: string,
+  headers: Headers,
+  sysHash: string,
+  toolsHash: string,
+  msgsExact: string[],
+): void {
+  // 同会话演进（新 msgs 前缀包含旧 msgs）→ 更新旧条目而不是新增
+  for (const e of keepalives.values()) {
+    if (e.sysHash !== sysHash) continue;
+    const old = e.msgsExact;
+    if (old.length > msgsExact.length) continue;
+    let prefix = true;
+    for (let i = 0; i < old.length; i++) {
+      if (old[i] !== msgsExact[i]) { prefix = false; break; }
+    }
+    if (prefix) {
+      e.body = outbound;
+      e.target = target;
+      e.headers = headers;
+      e.msgsExact = msgsExact;
+      e.lastReal = Date.now();
+      return;
+    }
+  }
+  const key = keepaliveKey(sysHash, toolsHash, msgsExact);
+  keepalives.set(key, { key, sysHash, msgsExact, lastReal: Date.now(), target, headers, body: outbound });
+  if (keepalives.size > 20) {
+    const oldest = [...keepalives.values()].sort((a, b) => a.lastReal - b.lastReal)[0];
+    if (oldest) keepalives.delete(oldest.key);
+  }
+}
+
+function keepaliveBodyOf(original: Uint8Array): Uint8Array {
+  try {
+    const obj = JSON.parse(new TextDecoder().decode(original));
+    obj.stream = false;
+    obj.max_tokens = 1;
+    delete obj.thinking;
+    return new TextEncoder().encode(JSON.stringify(obj));
+  } catch {
+    return original;
+  }
+}
+
+async function runKeepalive(): Promise<void> {
+  const now = Date.now();
+  for (const e of [...keepalives.values()]) {
+    const idle = now - e.lastReal;
+    if (idle >= KEEP_IDLE_MS) {
+      keepalives.delete(e.key);
+      console.log(`[keepalive] drop ${e.key} (idle ${Math.round(idle / 60000)}m)`);
+      continue;
+    }
+    if (idle < KEEP_INTERVAL_MS) continue;
+    try {
+      const body = keepaliveBodyOf(e.body);
+      const headers = new Headers(e.headers);
+      headers.set("content-type", "application/json");
+      const resp = await fetch(e.target, {
+        method: "POST",
+        headers,
+        body,
+        ...(body !== null && typeof body === "object" ? { duplex: "half" } : {}),
+      } as RequestInit);
+      const text = await resp.text();
+      const usage = extractUsage(text);
+      const read = Number(usage.cache_read_input_tokens) || 0;
+      console.log(`[keepalive] ${e.key} status=${resp.status} read=${read} idle=${Math.round(idle / 60000)}m`);
+      e.lastReal = Date.now();
+    } catch (err) {
+      console.log(`[keepalive] ${e.key} FAIL ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+if (KEEPALIVE_ENABLED) {
+  setInterval(() => { void runKeepalive(); }, KEEP_INTERVAL_MS);
+  console.log(`[keepalive] enabled (interval=${KEEP_INTERVAL_MS / 60000}m idle=${KEEP_IDLE_MS / 60000}m)`);
+}
+
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = normalizePath(url.pathname);
@@ -859,6 +973,9 @@ async function handler(req: Request): Promise<Response> {
       cache: CACHE_ENABLED ? "1h/tools+system+messages" : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
       maxBreakpoints: MAX_BREAKPOINTS,
+      keepalive: KEEPALIVE_ENABLED
+        ? { enabled: true, intervalMin: KEEP_INTERVAL_MS / 60000, idleMin: KEEP_IDLE_MS / 60000, sessions: keepalives.size }
+        : { enabled: false },
       cacheTtl: TTL,
       minChars: MIN_CHARS,
       timeInjection: TIME_ENABLED ? "last-user-block-after-breakpoint" : "off",
@@ -1034,15 +1151,12 @@ async function handler(req: Request): Promise<Response> {
   if (LOG_BODY) rec.body = sanitizeForLog(body);
 
   body = sortDeep(body); // deterministic canonical serialization (official format)
+  const outboundBytes = new TextEncoder().encode(JSON.stringify(body));
+  if (KEEPALIVE_ENABLED && isMessages(path) && msgsExact && msgsExact.length > 0) {
+    registerKeepalive(outboundBytes, target, headers, rec.sysHash, rec.toolsHash, msgsExact);
+  }
   headers.set("content-type", "application/json");
-  return await forwardOnce(
-    "POST",
-    target,
-    headers,
-    new TextEncoder().encode(JSON.stringify(body)),
-    rec,
-    rec.convertSse,
-  );
+  return await forwardOnce("POST", target, headers, outboundBytes, rec, rec.convertSse);
 }
 
 Deno.serve({ port: PORT, hostname: "0.0.0.0" }, handler);

@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-bp2";
+const VERSION = "v7-bp3";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "1h").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -458,6 +458,10 @@ function injectBreakpoints(body: Any): { applied: string[]; skipped?: string } {
     applied.push(label);
     budget--;
   };
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tool = body.tools.filter(isObj).at(-1);
+    if (tool) mark(tool, `tools[${body.tools.length - 1}]`);
+  }
   if (body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);

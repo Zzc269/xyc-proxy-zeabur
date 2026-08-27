@@ -22,6 +22,7 @@
  *   INJECT_CURRENT_TIME "0" = 不注入时间；默认开
  *   TIME_ZONE           默认 Asia/Shanghai
  *   FORCE_NON_STREAM    "1" = 强制非流式再转 SSE
+ *   CACHE_TTL           "5m"(默认) | "1h"；5m 用原生 ephemeral(不发 extended beta)，1h 发 beta + ttl:1h
  *   LOG_BODY            "0" = 不记改写后请求体；默认记（图片/超长文本会裁）
  *   DEBUG               "1" = 成功请求也打 console，且请求体文本裁得更长
  *   PORT                Zeabur 注入；本地默认 8080
@@ -31,10 +32,11 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-diag";
+const VERSION = "v7-ttl";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
-const TTL = "1h";
-const BETA_FLAG = "extended-cache-ttl-2025-04-11";
+const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "5m").toLowerCase() === "1h" ? "1h" : "5m";
+const TTL = CACHE_TTL;
+const BETA_FLAG = TTL === "1h" ? "extended-cache-ttl-2025-04-11" : "";
 const MAX_BREAKPOINTS = 4;
 const MIN_CHARS = 1500;
 const MAX_LOGS = 250;
@@ -179,7 +181,7 @@ function isChat(p: string): boolean {
 }
 
 function cc() {
-  return { type: "ephemeral", ttl: TTL };
+  return TTL === "1h" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
 }
 
 function formatTime(date = new Date(), withSeconds = false): string {
@@ -779,6 +781,7 @@ async function handler(req: Request): Promise<Response> {
       cache: CACHE_ENABLED ? "1h/tools+system+messages" : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
       maxBreakpoints: MAX_BREAKPOINTS,
+      cacheTtl: TTL,
       minChars: MIN_CHARS,
       timeInjection: TIME_ENABLED ? "last-user-block-after-breakpoint" : "off",
       timeZone: TIME_ZONE,
@@ -892,7 +895,7 @@ async function handler(req: Request): Promise<Response> {
       const t = appendRuntimeTime(body);
       rec.timeAdded = t.added ? "yes" : `no:${t.reason ?? "?"}`;
     }
-    headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
+    if (BETA_FLAG) headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
   } else if (CACHE_ENABLED && isChat(path)) {
     const inj = injectOpenAI(body);
     rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;

@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-rebuild";
+const VERSION = "v7-rebuild-beta";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "1h").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -857,7 +857,7 @@ async function handler(req: Request): Promise<Response> {
       version: VERSION,
       upstream: UPSTREAM,
       cache: CACHE_ENABLED ? "1h/tools+system+messages" : "passthrough",
-      beta: "not-sent",
+      beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
       maxBreakpoints: MAX_BREAKPOINTS,
       cacheTtl: TTL,
       minChars: MIN_CHARS,
@@ -976,7 +976,7 @@ async function handler(req: Request): Promise<Response> {
       const t = appendRuntimeTime(body);
       rec.timeAdded = t.added ? "yes" : `no:${t.reason ?? "?"}`;
     }
-    // beta header intentionally NOT sent (legacy extended-cache-ttl beta obsolete per 2026 docs)
+    if (BETA_FLAG) headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
   } else if (CACHE_ENABLED && isChat(path)) {
     const inj = injectOpenAI(body);
     rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;

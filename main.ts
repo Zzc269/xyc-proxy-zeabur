@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-kep";
+const VERSION = "v7-pass";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "5m").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -1081,25 +1081,8 @@ async function handler(req: Request): Promise<Response> {
   rec.tools = Array.isArray(body?.tools) ? body.tools.length : 0;
   rec.roles = rolesOf(body);
 
-  if (CACHE_ENABLED && isMessages(path)) {
-    const rebuilt = rebuildBody(body);
-    body = rebuilt.body;
-    stripOldTime(body);
-    normalizeAnthropicMessages(body);
-    const inj = injectBreakpoints(body);
-    rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;
-    if (rebuilt.dropped.length) rec.applied += `|dropped:[${rebuilt.dropped.join(",")}]`;
-    if (TIME_ENABLED) {
-      const t = appendRuntimeTime(body);
-      rec.timeAdded = t.added ? "yes" : `no:${t.reason ?? "?"}`;
-    }
-    if (BETA_FLAG) headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
-  } else if (CACHE_ENABLED && isChat(path)) {
-    const inj = injectOpenAI(body);
-    rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;
-  } else {
-    rec.applied = "cache-off";
-  }
+  // 纯透传：不改写 LobeHub 请求体（LobeHub 自带 5m cache_control），只记录指纹供保活/诊断
+  rec.applied = "passthrough";
 
   rec.outboundBp = scanBreakpoints(body);
   rec.outboundBeta = headers.get("anthropic-beta") ?? "";
@@ -1150,13 +1133,15 @@ async function handler(req: Request): Promise<Response> {
 
   if (LOG_BODY) rec.body = sanitizeForLog(body);
 
-  body = sortDeep(body); // deterministic canonical serialization (official format)
-  const outboundBytes = new TextEncoder().encode(JSON.stringify(body));
+  // 纯透传：FORCE_NON_STREAM 关闭时用原始字节转发，不对请求做任何改动
+  const outboundBytes: Uint8Array = rec.convertSse
+    ? new TextEncoder().encode(JSON.stringify(body))
+    : (inbound ?? new Uint8Array());
   if (KEEPALIVE_ENABLED && isMessages(path) && msgsExact && msgsExact.length > 0) {
     registerKeepalive(outboundBytes, target, headers, rec.sysHash, rec.toolsHash, msgsExact);
   }
   headers.set("content-type", "application/json");
-  return await forwardOnce("POST", target, headers, outboundBytes, rec, rec.convertSse);
+  return await forwardOnce("POST", target, headers, outboundBytes as unknown as BodyInit, rec, rec.convertSse);
 }
 
 Deno.serve({ port: PORT, hostname: "0.0.0.0" }, handler);

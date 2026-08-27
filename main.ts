@@ -1,30 +1,47 @@
 /**
- * xyc relay v4 — Claude 1h nested cache + runtime time after breakpoints
- * Deno / Zeabur 单文件
+ * xyc-proxy v5 — LobeHub → XYC Claude 1h prompt cache + full diagnostics
  *
- * 默认透传流式。FORCE_NON_STREAM=1 才改成非流式再转 SSE。
+ * 1h 三件套：
+ *   1. anthropic-beta: extended-cache-ttl-2025-04-11
+ *   2. cache_control: { type: "ephemeral", ttl: "1h" }
+ *   3. 断点前前缀够长
  *
- * 缓存：tools → 去掉时间后的 system → 稳定历史尾（最多 4 个 1h 断点）
- * 时间：代理生成，永远是最后一条 user，不带 cache_control
+ * 最多 4 个断点：清掉 LobeHub 5m → tools 最后一项 → system 最后一块 → messages 从后往前。
+ * 时间块加在最后一条 user 的断点之后，本身不带 cache_control。
+ *
+ * 日志默认全开（不依赖 DEBUG）：
+ *   GET /logs        文本
+ *   GET /logs.json   JSON
+ *   GET|POST /logs/clear
+ * 有 PROXY_TOKEN 时：/logs?proxy_token=...
  *
  * 环境变量：
- *   UPSTREAM_URL        默认 https://cn.chatapi.app
- *   PROXY_TOKEN         可选；有则请求必须带 x-proxy-token
+ *   UPSTREAM_URL        默认 https://apicdn.xyc.ai
+ *   PROXY_TOKEN         可选
  *   CACHE_TTL_ON        "0" = 不改 cache；默认开
  *   INJECT_CURRENT_TIME "0" = 不注入时间；默认开
  *   TIME_ZONE           默认 Asia/Shanghai
- *   FORCE_NON_STREAM    "1" = 强制非流式 + SSE；默认关（透传流式）
- *   DEBUG_CACHE         "1" = 打日志
- *   PORT                默认 8000
+ *   FORCE_NON_STREAM    "1" = 强制非流式再转 SSE
+ *   LOG_BODY            "0" = 不记改写后请求体；默认记（图片/超长文本会裁）
+ *   DEBUG               "1" = 成功请求也打 console，且请求体文本裁得更长
+ *   PORT                Zeabur 注入；本地默认 8080
  */
 
 const PROVIDER = "xyc";
-const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
+const VERSION = "v5-diag";
+const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 const MAX_BREAKPOINTS = 4;
-const MIN_CHARS = 2000;
-const RUNTIME_MARKER = "xyc-proxy-runtime-time-v2";
+const MIN_CHARS = 1500;
+const MAX_LOGS = 250;
+const RAW_LIMIT = 2000;
+const RUNTIME_MARKERS = [
+  "xyc-proxy-runtime-time-v1",
+  "xyc-proxy-runtime-time-v2",
+  "xyc-proxy-runtime-time-v5",
+];
+const RUNTIME_MARKER = RUNTIME_MARKERS[2];
 const TIME_LINE_RE =
   /(?:^|\n)[ \t]*当前北京时间：\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\s*[（(]Asia\/Shanghai[）)][ \t]*/;
 
@@ -37,9 +54,11 @@ const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
 const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") === "1";
-const DEBUG_CACHE = Deno.env.get("DEBUG_CACHE") === "1";
-const parsedPort = Number(Deno.env.get("PORT") || "8000");
-const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? Math.trunc(parsedPort) : 8000;
+const DEBUG = Deno.env.get("DEBUG") === "1";
+const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
+const parsedPort = Number(Deno.env.get("PORT") || "8080");
+const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? Math.trunc(parsedPort) : 8080;
+const TEXT_KEEP = DEBUG ? 12000 : 4000;
 
 const CACHEABLE = new Set([
   "text",
@@ -75,7 +94,44 @@ const STRIP = [
   "x-forwarded-proto",
 ];
 
+interface LogRec {
+  ts: string;
+  id: string;
+  method: string;
+  path: string;
+  model: string;
+  streamIn: boolean;
+  streamOut: boolean;
+  convertSse: boolean;
+  inboundBeta: string;
+  outboundBeta: string;
+  anthropicVersion: string;
+  inboundBp: string;
+  outboundBp: string;
+  applied: string;
+  timeAdded: string;
+  chars: number;
+  tools: number;
+  roles: string;
+  sysHash: string;
+  toolsHash: string;
+  msgHashes: string;
+  prefixHash: string;
+  samePrefixAsPrev: boolean | null;
+  hasXApiKey: boolean;
+  hasAuthorization: boolean;
+  status?: number;
+  ms?: number;
+  respLen?: number;
+  usage?: Record<string, string>;
+  raw?: string;
+  error?: string;
+  body?: unknown;
+}
+
+const LOGS: LogRec[] = [];
 let sequence = 0;
+let lastPrefixHash: string | null = null;
 
 function isObj(v: unknown): v is Record<string, Any> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -84,7 +140,7 @@ function isObj(v: unknown): v is Record<string, Any> {
 function json(data: unknown, status = 200, id = ""): Response {
   const headers = new Headers({ ...CORS, "content-type": "application/json; charset=utf-8" });
   if (id) headers.set("x-proxy-request-id", id);
-  return new Response(JSON.stringify(data), { status, headers });
+  return new Response(JSON.stringify(data, null, 2), { status, headers });
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -114,9 +170,9 @@ function cc() {
   return { type: "ephemeral", ttl: TTL };
 }
 
-function formatTime(date = new Date()): string {
+function formatTime(date = new Date(), withSeconds = false): string {
   try {
-    return new Intl.DateTimeFormat("sv-SE", {
+    const options: Intl.DateTimeFormatOptions = {
       timeZone: TIME_ZONE,
       year: "numeric",
       month: "2-digit",
@@ -124,10 +180,118 @@ function formatTime(date = new Date()): string {
       hour: "2-digit",
       minute: "2-digit",
       hourCycle: "h23",
-    }).format(date);
+    };
+    if (withSeconds) options.second = "2-digit";
+    return new Intl.DateTimeFormat("sv-SE", options).format(date);
   } catch {
     return date.toISOString();
   }
+}
+
+function clock(): string {
+  return formatTime(new Date(), true).replace("T", " ");
+}
+
+function pushLog(rec: LogRec): void {
+  LOGS.push(rec);
+  while (LOGS.length > MAX_LOGS) LOGS.shift();
+  const line = formatLog(rec);
+  if (DEBUG || rec.error || (rec.status !== undefined && rec.status >= 400)) {
+    console.log(line);
+  } else {
+    console.log(`${rec.ts} ${rec.id} ${rec.path} ${rec.model} ${rec.status ?? "-"} ${usageLine(rec)}`);
+  }
+}
+
+function usageLine(rec: LogRec): string {
+  const u = rec.usage ?? {};
+  return `read=${u.cache_read_input_tokens ?? "-"} create=${u.cache_creation_input_tokens ?? "-"} w1h=${u.ephemeral_1h_input_tokens ?? "-"} w5m=${u.ephemeral_5m_input_tokens ?? "-"} in=${u.input_tokens ?? "-"} out=${u.output_tokens ?? "-"}`;
+}
+
+function formatLog(rec: LogRec): string {
+  const lines = [
+    `${rec.ts} ${rec.id} ${rec.method} ${rec.path}`,
+    `  model=${rec.model} streamIn=${rec.streamIn} streamOut=${rec.streamOut} convertSse=${rec.convertSse}`,
+    `  betaIn=${rec.inboundBeta || "-"} betaOut=${rec.outboundBeta || "-"} ver=${rec.anthropicVersion || "-"}`,
+    `  auth x-api-key=${rec.hasXApiKey} authorization=${rec.hasAuthorization}`,
+    `  inboundBp=${rec.inboundBp}`,
+    `  outboundBp=${rec.outboundBp}`,
+    `  applied=${rec.applied} time=${rec.timeAdded} chars=${rec.chars} tools=${rec.tools} roles=${rec.roles}`,
+    `  sysHash=${rec.sysHash} toolsHash=${rec.toolsHash}`,
+    `  msgHashes=${rec.msgHashes}`,
+    `  prefixHash=${rec.prefixHash} samePrefixAsPrev=${rec.samePrefixAsPrev}`,
+  ];
+  if (rec.status !== undefined) {
+    lines.push(`  status=${rec.status} ms=${rec.ms ?? "-"} respLen=${rec.respLen ?? "-"} ${usageLine(rec)}`);
+  }
+  if (rec.usage) {
+    lines.push(`  usageJson=${JSON.stringify(rec.usage)}`);
+  }
+  if (rec.error) lines.push(`  error=${rec.error}`);
+  if (rec.raw) lines.push(`  RAW <${rec.raw}>`);
+  if (rec.body !== undefined) {
+    try {
+      lines.push(`  BODY ${JSON.stringify(rec.body)}`);
+    } catch {
+      lines.push("  BODY <unserializable>");
+    }
+  }
+  return lines.join("\n");
+}
+
+function shortHash(v: unknown): string {
+  let s: string;
+  try {
+    s = typeof v === "string" ? v : JSON.stringify(v ?? null);
+  } catch {
+    s = String(v);
+  }
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return `${(h >>> 0).toString(16).padStart(8, "0")}/${s.length}`;
+}
+
+function isRuntimeText(text: string): boolean {
+  return RUNTIME_MARKERS.some((m) => text.includes(m)) || TIME_LINE_RE.test(`\n${text}`);
+}
+
+function diagnosticValue(v: unknown): unknown {
+  if (Array.isArray(v)) {
+    return v
+      .filter((item) =>
+        !(isObj(item) && item.type === "text" && typeof item.text === "string" && isRuntimeText(item.text))
+      )
+      .map(diagnosticValue);
+  }
+  if (!isObj(v)) return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (k === "cache_control") continue;
+    out[k] = diagnosticValue(val);
+  }
+  return out;
+}
+
+function diagnosticHash(v: unknown): string {
+  return shortHash(diagnosticValue(v));
+}
+
+function messageHashes(body: Any): string {
+  if (!Array.isArray(body?.messages)) return "-";
+  return body.messages.map((msg: unknown, i: number) => {
+    if (!isObj(msg)) return `${i}?:invalid`;
+    const role = String(msg.role ?? "?").slice(0, 1);
+    return `${i}${role}:${diagnosticHash(msg.content)}`;
+  }).join(",");
+}
+
+function rolesOf(body: Any): string {
+  if (!Array.isArray(body?.messages)) return "-";
+  return body.messages.map((msg: unknown) => isObj(msg) ? String(msg.role ?? "?").slice(0, 1) : "?").join("");
+}
+
+function prefixHashOf(body: Any): string {
+  return diagnosticHash({ tools: body?.tools ?? null, system: body?.system ?? null, messages: body?.messages ?? null });
 }
 
 function approxChars(body: Any): number {
@@ -157,11 +321,14 @@ function holders(body: Any): Record<string, Any>[] {
   walk(body?.system);
   walk(body?.messages);
   walk(body?.tools);
+  if (isObj(body) && isObj(body.cache_control)) out.push(body);
   return out;
 }
 
-function stripCache(body: Any): void {
-  for (const h of holders(body)) delete h.cache_control;
+function stripCache(body: Any): number {
+  const found = holders(body);
+  for (const h of found) delete h.cache_control;
+  return found.length;
 }
 
 function toBlocks(v: unknown): Record<string, Any>[] | null {
@@ -188,19 +355,12 @@ function extractTimeLine(text: string): string {
   return next;
 }
 
-function isRuntimeTimeText(text: string): boolean {
-  return text.includes(RUNTIME_MARKER) || TIME_LINE_RE.test(`\n${text}`);
-}
-
-/** 清掉提示词/历史里旧的北京时间，以及代理上一轮追加的时间消息 */
 function stripOldTime(body: Any): void {
   if (typeof body.system === "string") {
     body.system = extractTimeLine(body.system);
   } else if (Array.isArray(body.system)) {
     for (const block of body.system) {
-      if (isObj(block) && typeof block.text === "string") {
-        block.text = extractTimeLine(block.text);
-      }
+      if (isObj(block) && typeof block.text === "string") block.text = extractTimeLine(block.text);
     }
     body.system = body.system.filter((b: unknown) => {
       if (!isObj(b)) return true;
@@ -208,21 +368,18 @@ function stripOldTime(body: Any): void {
       return true;
     });
   }
-
   if (!Array.isArray(body.messages)) return;
   body.messages = body.messages.filter((msg: unknown) => {
     if (!isObj(msg)) return true;
-
     if (typeof msg.content === "string") {
-      if (msg.content.includes(RUNTIME_MARKER)) return false;
+      if (RUNTIME_MARKERS.some((m) => msg.content.includes(m))) return false;
       msg.content = extractTimeLine(msg.content);
       return msg.content.trim() !== "";
     }
-
     if (!Array.isArray(msg.content)) return true;
     msg.content = msg.content.filter((block: unknown) => {
       if (!isObj(block) || typeof block.text !== "string") return true;
-      if (block.text.includes(RUNTIME_MARKER)) return false;
+      if (RUNTIME_MARKERS.some((m) => block.text.includes(m))) return false;
       block.text = extractTimeLine(block.text);
       if (block.type === "text" && block.text.trim() === "") return false;
       return true;
@@ -235,82 +392,180 @@ function normalizeAnthropicMessages(body: Any): void {
   if (!Array.isArray(body?.messages)) return;
   for (const msg of body.messages) {
     if (!isObj(msg)) continue;
-    if (typeof msg.content === "string") {
-      if (msg.content.trim() === "") continue;
+    if (typeof msg.content === "string" && msg.content.trim() !== "") {
       msg.content = [{ type: "text", text: msg.content }];
     }
   }
 }
 
-function injectBreakpoints(body: Any): void {
-  stripCache(body);
-  if (approxChars(body) < MIN_CHARS) return;
-
+function injectBreakpoints(body: Any): { applied: string[]; skipped?: string } {
+  const removed = stripCache(body);
+  const applied: string[] = [];
+  if (removed > 0) applied.push(`removed5m:${removed}`);
+  if (approxChars(body) < MIN_CHARS) {
+    return { applied, skipped: `too-small:${approxChars(body)}<${MIN_CHARS}` };
+  }
   let budget = MAX_BREAKPOINTS;
-  const mark = (h: Record<string, Any>) => {
+  const mark = (h: Record<string, Any>, label: string) => {
     if (budget <= 0 || isObj(h.cache_control)) return;
     h.cache_control = cc();
+    applied.push(label);
     budget--;
   };
-
   if (Array.isArray(body.tools) && body.tools.length > 0) {
     const tool = body.tools.filter(isObj).at(-1);
-    if (tool) mark(tool);
+    if (tool) mark(tool, `tools[${body.tools.length - 1}]`);
   }
-
   if (body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);
     if (blocks && target) {
       body.system = blocks;
-      mark(target);
+      mark(target, "system");
     }
   }
-
-  if (Array.isArray(body.messages) && body.messages.length > 0) {
-    let placed = 0;
-    for (let i = body.messages.length - 1; i >= 0 && placed < 2 && budget > 0; i--) {
+  if (Array.isArray(body.messages)) {
+    for (let i = body.messages.length - 1; i >= 0 && budget > 0; i--) {
       const msg = body.messages[i];
       if (!isObj(msg)) continue;
       const blocks = toBlocks(msg.content);
       const target = blocks && lastCacheable(blocks);
       if (!blocks || !target || isObj(target.cache_control)) continue;
       msg.content = blocks;
-      mark(target);
-      placed++;
+      mark(target, `msg[${i}]:${msg.role ?? "?"}`);
     }
   }
+  if (applied.filter((x) => !x.startsWith("removed")).length === 0) {
+    return { applied, skipped: "no-cacheable-block" };
+  }
+  return { applied };
 }
 
-function appendRuntimeTime(body: Any): void {
-  if (!Array.isArray(body.messages)) body.messages = [];
-  const line =
-    `<!-- ${RUNTIME_MARKER} -->\n` +
-    `当前北京时间：${formatTime()}（${TIME_ZONE}）`;
-  body.messages.push({
-    role: "user",
-    content: [{ type: "text", text: line }],
+function appendRuntimeTime(body: Any): { added: boolean; reason?: string } {
+  if (!Array.isArray(body?.messages) || body.messages.length === 0) {
+    return { added: false, reason: "no-messages" };
+  }
+  const last = body.messages.at(-1);
+  if (!isObj(last) || last.role !== "user") return { added: false, reason: "last-not-user" };
+  if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+  if (!Array.isArray(last.content)) return { added: false, reason: "unsupported-content" };
+  last.content.push({
+    type: "text",
+    text: `<!-- ${RUNTIME_MARKER} -->\n当前北京时间：${formatTime()}（${TIME_ZONE}）`,
   });
+  return { added: true };
 }
 
-function injectOpenAI(body: Any): void {
-  stripCache(body);
-  if (approxChars(body) < MIN_CHARS || !Array.isArray(body.messages)) return;
+function injectOpenAI(body: Any): { applied: string[]; skipped?: string } {
+  const removed = stripCache(body);
+  const applied: string[] = [];
+  if (removed > 0) applied.push(`removed:${removed}`);
+  if (approxChars(body) < MIN_CHARS) return { applied, skipped: "too-small" };
+  if (!Array.isArray(body.messages)) return { applied, skipped: "no-messages" };
   for (const msg of body.messages) {
     if (!isObj(msg) || msg.role !== "system") continue;
     if (Array.isArray(msg.content)) {
       const t = lastCacheable(msg.content.filter(isObj));
-      if (t) t.cache_control = cc();
+      if (t) {
+        t.cache_control = cc();
+        applied.push("system-block");
+      }
     } else if (typeof msg.content === "string") {
       msg.cache_control = cc();
+      applied.push("system-message");
     }
   }
+  return { applied };
 }
 
 function mergeBeta(current: string | null): string {
   const parts = (current ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!parts.includes(BETA_FLAG)) parts.push(BETA_FLAG);
   return parts.join(",");
+}
+
+function scanBreakpoints(body: Any): string {
+  const found: string[] = [];
+  const ttlOf = (v: unknown): string | null => {
+    if (!isObj(v) || !isObj(v.cache_control)) return null;
+    const ttl = v.cache_control.ttl;
+    const type = v.cache_control.type ?? "ephemeral";
+    return `${type}:${ttl ?? "5m"}`;
+  };
+  if (isObj(body) && ttlOf(body)) found.push(`top:${ttlOf(body)}`);
+  if (Array.isArray(body?.tools)) {
+    body.tools.forEach((tool: unknown, i: number) => {
+      const ttl = ttlOf(tool);
+      if (ttl) found.push(`tool${i}:${ttl}`);
+    });
+  }
+  if (Array.isArray(body?.system)) {
+    body.system.forEach((block: unknown, i: number) => {
+      const ttl = ttlOf(block);
+      if (ttl) found.push(`sys${i}:${ttl}`);
+    });
+  } else if (typeof body?.system === "string" && isObj(body) && ttlOf(body)) {
+    found.push(`sys:${ttlOf(body)}`);
+  }
+  if (Array.isArray(body?.messages)) {
+    body.messages.forEach((msg: unknown, i: number) => {
+      if (!isObj(msg)) return;
+      const msgTtl = ttlOf(msg);
+      if (msgTtl) found.push(`msg${i}:${msgTtl}`);
+      if (!Array.isArray(msg.content)) return;
+      msg.content.forEach((block: unknown, j: number) => {
+        const ttl = ttlOf(block);
+        if (ttl) found.push(`msg${i}.${j}:${ttl}`);
+      });
+    });
+  }
+  return found.length === 0 ? "none" : `${found.length}[${found.join(",")}]`;
+}
+
+function clipText(text: string): string {
+  if (text.length <= TEXT_KEEP) return text;
+  return `${text.slice(0, TEXT_KEEP)}…[len=${text.length}]`;
+}
+
+function sanitizeForLog(v: unknown): unknown {
+  if (typeof v === "string") return clipText(v);
+  if (Array.isArray(v)) return v.map(sanitizeForLog);
+  if (!isObj(v)) return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) {
+    if ((k === "data" || k === "bytes" || k === "source") && typeof val === "string" && val.length > 80) {
+      out[k] = `<blob ${shortHash(val)}>`;
+    } else if (k === "source" && isObj(val) && typeof val.data === "string") {
+      out[k] = { ...val, data: `<blob ${shortHash(val.data)}>` };
+    } else {
+      out[k] = sanitizeForLog(val);
+    }
+  }
+  return out;
+}
+
+function extractUsage(text: string): Record<string, string> {
+  const keys = [
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "ephemeral_1h_input_tokens",
+    "ephemeral_5m_input_tokens",
+    "input_tokens",
+    "output_tokens",
+    "thinking_tokens",
+    "cache_creation",
+  ];
+  const usage: Record<string, string> = {};
+  for (const key of keys) {
+    if (key === "cache_creation") continue;
+    const pattern = new RegExp(`"${key}"\\s*:\\s*(\\d+)`, "g");
+    let value = "";
+    for (const match of text.matchAll(pattern)) value = match[1];
+    if (value) usage[key] = value;
+  }
+  const stop = text.match(/"stop_reason"\s*:\s*"([^"]*)"/);
+  if (stop) usage.stop_reason = stop[1];
+  return usage;
 }
 
 function responseHeaders(source: Headers, id: string): Headers {
@@ -341,10 +596,8 @@ function toSse(text: string): string {
   if (isObj(parsed.error)) {
     return `${sseFrame("error", { type: "error", error: parsed.error })}\n\n`;
   }
-
   const events: string[] = [];
   events.push(sseFrame("message_start", { type: "message_start", message: { ...parsed, content: [] } }));
-
   const blocks = Array.isArray(parsed.content) ? parsed.content : [];
   blocks.forEach((block: unknown, index: number) => {
     if (!isObj(block)) return;
@@ -352,7 +605,6 @@ function toSse(text: string): string {
     if (block.type === "text") start.content_block.text = "";
     if (block.type === "tool_use") start.content_block.input = undefined;
     events.push(sseFrame("content_block_start", start));
-
     if (block.type === "text" && typeof block.text === "string") {
       events.push(sseFrame("content_block_delta", {
         type: "content_block_delta",
@@ -374,7 +626,6 @@ function toSse(text: string): string {
     }
     events.push(sseFrame("content_block_stop", { type: "content_block_stop", index }));
   });
-
   events.push(sseFrame("message_delta", {
     type: "message_delta",
     delta: { stop_reason: parsed.stop_reason ?? null, stop_sequence: parsed.stop_sequence ?? null },
@@ -384,34 +635,83 @@ function toSse(text: string): string {
   return events.join("\n\n") + "\n\n";
 }
 
+function finishLog(rec: LogRec, status: number, ms: number, text: string, ok: boolean): void {
+  rec.status = status;
+  rec.ms = ms;
+  rec.respLen = text.length;
+  rec.usage = extractUsage(text);
+  const hasUsage = Boolean(rec.usage && (rec.usage.input_tokens || rec.usage.cache_read_input_tokens || rec.usage.cache_creation_input_tokens));
+  if (!ok || !hasUsage) {
+    rec.raw = text.slice(0, RAW_LIMIT).replace(/\s+/g, " ");
+  }
+  pushLog(rec);
+}
+
 async function forwardOnce(
   method: string,
   target: string,
   headers: Headers,
   body: BodyInit | null,
-  meta: { id: string; convertSse?: boolean },
+  rec: LogRec,
+  convertSse: boolean,
 ): Promise<Response> {
   let upstream: Response;
+  const started = performance.now();
   try {
     upstream = await fetch(target, { method, headers, body });
   } catch (e) {
-    return json({ error: `upstream error: ${e instanceof Error ? e.message : String(e)}` }, 502, meta.id);
+    rec.error = `upstream fetch: ${e instanceof Error ? e.message : String(e)}`;
+    rec.status = 502;
+    rec.ms = Math.round(performance.now() - started);
+    pushLog(rec);
+    return json({ error: rec.error, id: rec.id }, 502, rec.id);
   }
+  const elapsed = Math.round(performance.now() - started);
 
-  if (meta.convertSse) {
+  if (convertSse) {
     let text = "";
     try {
       text = await new Response(upstream.body).text();
     } catch (e) {
-      return json({ error: `upstream read error: ${e instanceof Error ? e.message : String(e)}` }, 502, meta.id);
+      rec.error = `upstream read: ${e instanceof Error ? e.message : String(e)}`;
+      rec.status = 502;
+      rec.ms = elapsed;
+      pushLog(rec);
+      return json({ error: rec.error, id: rec.id }, 502, rec.id);
     }
-    const out = responseHeaders(upstream.headers, meta.id);
+    finishLog(rec, upstream.status, elapsed, text, upstream.ok);
+    const out = responseHeaders(upstream.headers, rec.id);
     out.set("content-type", "text/event-stream; charset=utf-8");
     return new Response(toSse(text), { status: upstream.status, headers: out });
   }
 
-  const out = responseHeaders(upstream.headers, meta.id);
-  return new Response(upstream.body, { status: upstream.status, headers: out });
+  const out = responseHeaders(upstream.headers, rec.id);
+  if (!upstream.body) {
+    rec.status = upstream.status;
+    rec.ms = elapsed;
+    rec.error = "no-body";
+    pushLog(rec);
+    return new Response(null, { status: upstream.status, headers: out });
+  }
+  const [toClient, toLog] = upstream.body.tee();
+  void (async () => {
+    try {
+      const text = await new Response(toLog).text();
+      finishLog(rec, upstream.status, elapsed, text, upstream.ok);
+    } catch (e) {
+      rec.error = `usage-log: ${e instanceof Error ? e.message : String(e)}`;
+      rec.status = upstream.status;
+      rec.ms = elapsed;
+      pushLog(rec);
+    }
+  })();
+  return new Response(toClient, { status: upstream.status, headers: out });
+}
+
+function logsAuthorized(req: Request, url: URL): boolean {
+  if (!PROXY_TOKEN) return true;
+  const supplied = req.headers.get("x-proxy-token") || url.searchParams.get("proxy_token") || "";
+  return safeEqual(supplied, PROXY_TOKEN);
 }
 
 async function handler(req: Request): Promise<Response> {
@@ -430,14 +730,37 @@ async function handler(req: Request): Promise<Response> {
     return json({
       ok: true,
       provider: PROVIDER,
+      version: VERSION,
       upstream: UPSTREAM,
-      cache: CACHE_ENABLED ? "1h/tools+system+history" : "passthrough",
+      cache: CACHE_ENABLED ? "1h/tools+system+messages" : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
-      timeInjection: TIME_ENABLED ? "last-user-after-breakpoints" : "off",
+      maxBreakpoints: MAX_BREAKPOINTS,
+      minChars: MIN_CHARS,
+      timeInjection: TIME_ENABLED ? "last-user-block-after-breakpoint" : "off",
       timeZone: TIME_ZONE,
       forceNonStream: FORCE_NON_STREAM,
-      stream: FORCE_NON_STREAM ? "buffered-sse" : "passthrough",
+      logBody: LOG_BODY,
+      debug: DEBUG,
+      port: PORT,
+      logsInThisInstance: LOGS.length,
+      maxLogs: MAX_LOGS,
+      note: "GET /logs  or  /logs.json  — instance memory, lost on redeploy",
     });
+  }
+
+  if (req.method === "GET" && path === "/logs") {
+    const text = LOGS.length === 0 ? "No logs yet." : LOGS.map(formatLog).join("\n\n");
+    return new Response(text, { headers: { ...CORS, "content-type": "text/plain; charset=utf-8" } });
+  }
+
+  if (req.method === "GET" && path === "/logs.json") {
+    return json({ count: LOGS.length, lastPrefixHash, logs: LOGS });
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && path === "/logs/clear") {
+    LOGS.length = 0;
+    lastPrefixHash = null;
+    return new Response("Logs cleared.", { headers: { ...CORS, "content-type": "text/plain; charset=utf-8" } });
   }
 
   const id = requestId();
@@ -446,49 +769,104 @@ async function handler(req: Request): Promise<Response> {
   for (const h of STRIP) headers.delete(h);
   headers.set("x-proxy-request-id", id);
 
+  const rec: LogRec = {
+    ts: clock(),
+    id,
+    method: req.method,
+    path,
+    model: "?",
+    streamIn: false,
+    streamOut: false,
+    convertSse: false,
+    inboundBeta: req.headers.get("anthropic-beta") ?? "",
+    outboundBeta: "",
+    anthropicVersion: req.headers.get("anthropic-version") ?? "",
+    inboundBp: "-",
+    outboundBp: "-",
+    applied: "passthrough",
+    timeAdded: "off",
+    chars: 0,
+    tools: 0,
+    roles: "-",
+    sysHash: "-",
+    toolsHash: "-",
+    msgHashes: "-",
+    prefixHash: "-",
+    samePrefixAsPrev: null,
+    hasXApiKey: Boolean(req.headers.get("x-api-key")),
+    hasAuthorization: Boolean(req.headers.get("authorization")),
+  };
+
   let inbound: Uint8Array | null;
   try {
     inbound = req.body ? new Uint8Array(await req.arrayBuffer()) : null;
   } catch (e) {
-    return json({ error: `request body read error: ${e instanceof Error ? e.message : String(e)}` }, 400, id);
+    rec.error = `body read: ${e instanceof Error ? e.message : String(e)}`;
+    rec.status = 400;
+    pushLog(rec);
+    return json({ error: rec.error, id }, 400, id);
   }
 
   const rewrite = req.method === "POST" && (isMessages(path) || isChat(path));
   if (!rewrite) {
-    return await forwardOnce(req.method, target, headers, inbound ? inbound.buffer : null, { id });
+    rec.outboundBeta = headers.get("anthropic-beta") ?? rec.inboundBeta;
+    return await forwardOnce(req.method, target, headers, inbound, rec, false);
   }
 
   let body: Any;
   try {
     body = JSON.parse(new TextDecoder().decode(inbound ?? new Uint8Array()));
   } catch {
-    return json({ error: "bad json body" }, 400, id);
+    rec.error = "bad json body";
+    rec.status = 400;
+    rec.raw = new TextDecoder().decode(inbound ?? new Uint8Array()).slice(0, RAW_LIMIT);
+    pushLog(rec);
+    return json({ error: "bad json body", id }, 400, id);
   }
+
+  rec.model = typeof body?.model === "string" ? body.model : "?";
+  rec.streamIn = body?.stream === true;
+  rec.inboundBp = scanBreakpoints(body);
+  rec.chars = approxChars(body);
+  rec.tools = Array.isArray(body?.tools) ? body.tools.length : 0;
+  rec.roles = rolesOf(body);
 
   if (CACHE_ENABLED && isMessages(path)) {
     stripOldTime(body);
     normalizeAnthropicMessages(body);
-    injectBreakpoints(body);
-    if (TIME_ENABLED) appendRuntimeTime(body);
-    headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
-
-    if (DEBUG_CACHE) {
-      const last = body.messages?.at?.(-1);
-      console.log("DEBUG breakpoints:", holders(body).length);
-      console.log("DEBUG lastRole:", last?.role);
-      console.log("DEBUG lastIsTime:", JSON.stringify(last ?? "").includes(RUNTIME_MARKER));
-      console.log("DEBUG sysHasTime:", JSON.stringify(body.system ?? "").includes("当前北京时间"));
-      console.log("DEBUG stream:", body?.stream === true);
+    const inj = injectBreakpoints(body);
+    rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;
+    if (TIME_ENABLED) {
+      const t = appendRuntimeTime(body);
+      rec.timeAdded = t.added ? "yes" : `no:${t.reason ?? "?"}`;
     }
+    headers.set("anthropic-beta", mergeBeta(headers.get("anthropic-beta")));
   } else if (CACHE_ENABLED && isChat(path)) {
-    injectOpenAI(body);
+    const inj = injectOpenAI(body);
+    rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;
+  } else {
+    rec.applied = "cache-off";
   }
 
-  let convertSse = false;
+  rec.outboundBp = scanBreakpoints(body);
+  rec.outboundBeta = headers.get("anthropic-beta") ?? "";
+  rec.sysHash = diagnosticHash(body?.system ?? null);
+  rec.toolsHash = diagnosticHash(body?.tools ?? null);
+  rec.msgHashes = messageHashes(body);
+  rec.prefixHash = prefixHashOf(body);
+  rec.samePrefixAsPrev = lastPrefixHash === null ? null : lastPrefixHash === rec.prefixHash;
+  lastPrefixHash = rec.prefixHash;
+  rec.chars = approxChars(body);
+  rec.roles = rolesOf(body);
+  rec.tools = Array.isArray(body?.tools) ? body.tools.length : 0;
+
   if (FORCE_NON_STREAM && isMessages(path) && body?.stream === true) {
     body.stream = false;
-    convertSse = true;
+    rec.convertSse = true;
   }
+  rec.streamOut = body?.stream === true;
+
+  if (LOG_BODY) rec.body = sanitizeForLog(body);
 
   headers.set("content-type", "application/json");
   return await forwardOnce(
@@ -496,8 +874,9 @@ async function handler(req: Request): Promise<Response> {
     target,
     headers,
     new TextEncoder().encode(JSON.stringify(body)),
-    { id, convertSse },
+    rec,
+    rec.convertSse,
   );
 }
 
-Deno.serve({ port: PORT, onListen: () => {} }, handler);
+Deno.serve({ port: PORT, hostname: "0.0.0.0" }, handler);

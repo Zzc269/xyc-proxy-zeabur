@@ -930,6 +930,7 @@ async function runKeepalive(): Promise<void> {
       const body = keepaliveBodyOf(e.body);
       const headers = new Headers(e.headers);
       headers.set("content-type", "application/json");
+      const started = Date.now();
       const resp = await fetch(e.target, {
         method: "POST",
         headers,
@@ -939,9 +940,40 @@ async function runKeepalive(): Promise<void> {
       const text = await resp.text();
       const usage = extractUsage(text);
       const read = Number(usage.cache_read_input_tokens) || 0;
+      const krec: LogRec = {
+        ts: clock(), id: requestId(), method: "POST", path: "/keepalive",
+        model: "kept", streamIn: false, streamOut: false, convertSse: false,
+        inboundBeta: "", outboundBeta: "", anthropicVersion: "",
+        inboundBp: "-", outboundBp: "-", applied: `keepalive ${e.key}`,
+        timeAdded: "off", chars: body.length, tools: 0, roles: "-",
+        sysHash: e.sysHash, toolsHash: "-",
+        msgHashes: e.msgsExact.slice(-4).join(","), prefixHash: "-",
+        samePrefixAsPrev: null, hasPrev: null, sameToolsAsPrev: null,
+        msgHashesCanon: "-", commonMsgPrefix: 0, firstDiffMsg: -1,
+        prefixStableCanon: null, prefixStableExact: null,
+        hasXApiKey: false, hasAuthorization: false,
+        status: resp.status, ms: Date.now() - started, respLen: text.length,
+        usage,
+      };
+      pushLog(krec);
       console.log(`[keepalive] ${e.key} status=${resp.status} read=${read} idle=${Math.round(idle / 60000)}m`);
       e.lastReal = Date.now();
     } catch (err) {
+      const erec: LogRec = {
+        ts: clock(), id: requestId(), method: "POST", path: "/keepalive",
+        model: "kept", streamIn: false, streamOut: false, convertSse: false,
+        inboundBeta: "", outboundBeta: "", anthropicVersion: "",
+        inboundBp: "-", outboundBp: "-", applied: `keepalive ${e.key}`,
+        timeAdded: "off", chars: 0, tools: 0, roles: "-",
+        sysHash: e.sysHash, toolsHash: "-", msgHashes: (e.msgsExact.slice(-4)).join(","),
+        prefixHash: "-", samePrefixAsPrev: null, hasPrev: null, sameToolsAsPrev: null,
+        msgHashesCanon: "-", commonMsgPrefix: 0, firstDiffMsg: -1,
+        prefixStableCanon: null, prefixStableExact: null,
+        hasXApiKey: false, hasAuthorization: false,
+        status: 0, ms: 0, respLen: 0, usage: undefined,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      pushLog(erec);
       console.log(`[keepalive] ${e.key} FAIL ${err instanceof Error ? err.message : String(err)}`);
     }
   }

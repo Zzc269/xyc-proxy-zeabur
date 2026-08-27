@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-rebuild-beta";
+const VERSION = "v7-bp2";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "1h").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -458,10 +458,6 @@ function injectBreakpoints(body: Any): { applied: string[]; skipped?: string } {
     applied.push(label);
     budget--;
   };
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    const tool = body.tools.filter(isObj).at(-1);
-    if (tool) mark(tool, `tools[${body.tools.length - 1}]`);
-  }
   if (body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);
@@ -470,15 +466,15 @@ function injectBreakpoints(body: Any): { applied: string[]; skipped?: string } {
       mark(target, "system");
     }
   }
-  if (Array.isArray(body.messages)) {
-    for (let i = body.messages.length - 1; i >= 0 && budget > 0; i--) {
-      const msg = body.messages[i];
-      if (!isObj(msg)) continue;
-      const blocks = toBlocks(msg.content);
+  if (Array.isArray(body.messages) && body.messages.length > 0) {
+    const last = body.messages[body.messages.length - 1];
+    if (isObj(last)) {
+      const blocks = toBlocks(last.content);
       const target = blocks && lastCacheable(blocks);
-      if (!blocks || !target || isObj(target.cache_control)) continue;
-      msg.content = blocks;
-      mark(target, `msg[${i}]:${msg.role ?? "?"}`);
+      if (blocks && target) {
+        last.content = blocks;
+        mark(target, `msg[${body.messages.length - 1}]:${last.role ?? "?"}`);
+      }
     }
   }
   if (applied.filter((x) => !x.startsWith("removed")).length === 0) {

@@ -800,10 +800,24 @@ function normalizeMessage(msg: unknown): unknown {
   return out;
 }
 
-function rebuildBody(parsed: Any): Any {
+// Official top-level request fields (Anthropic Messages API). Anything else
+// from LobeHub is dropped as pollution.
+const OFFICIAL_FIELDS = new Set([
+  "model", "max_tokens", "system", "messages", "tools", "tool_choice",
+  "stream", "temperature", "top_p", "top_k", "stop_sequences",
+  "metadata", "service_tier", "thinking", "citations", "source",
+  "context_management", "effort", "task_budgets", "fast", "reasoning",
+]);
+
+function rebuildBody(parsed: Any): { body: Any; dropped: string[] } {
   const out: Any = {};
+  const dropped: string[] = [];
   for (const [k, v] of Object.entries(parsed ?? {})) {
     if (k === "cache_control") continue;
+    if (!OFFICIAL_FIELDS.has(k)) {
+      dropped.push(k);
+      continue;
+    }
     out[k] = v;
   }
   if (parsed?.system !== undefined) {
@@ -821,7 +835,7 @@ function rebuildBody(parsed: Any): Any {
     }
   }
   if (Array.isArray(parsed?.messages)) out.messages = parsed.messages.map(normalizeMessage);
-  return out;
+  return { body: out, dropped };
 }
 
 async function handler(req: Request): Promise<Response> {
@@ -951,11 +965,13 @@ async function handler(req: Request): Promise<Response> {
   rec.roles = rolesOf(body);
 
   if (CACHE_ENABLED && isMessages(path)) {
-    body = rebuildBody(body);
+    const rebuilt = rebuildBody(body);
+    body = rebuilt.body;
     stripOldTime(body);
     normalizeAnthropicMessages(body);
     const inj = injectBreakpoints(body);
     rec.applied = `${inj.applied.join(",") || "-"}${inj.skipped ? `|skip:${inj.skipped}` : ""}`;
+    if (rebuilt.dropped.length) rec.applied += `|dropped:[${rebuilt.dropped.join(",")}]`;
     if (TIME_ENABLED) {
       const t = appendRuntimeTime(body);
       rec.timeAdded = t.added ? "yes" : `no:${t.reason ?? "?"}`;

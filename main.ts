@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-pass";
+const VERSION = "v7-pass-stoponmiss";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "5m").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -942,6 +942,13 @@ async function runKeepalive(): Promise<void> {
       const text = await resp.text();
       const usage = extractUsage(text);
       const read = Number(usage.cache_read_input_tokens) || 0;
+      // 缓存没保住的会话不再续命：立即停止保活，等下一次真实请求再重建。
+      // 避免"缓存持续不命中"时保活反复触发全量重写白烧钱。
+      if (read === 0) {
+        keepalives.delete(e.key);
+        console.log(`[keepalive] ${e.key} read=0 (cache lost) -> stop keepalive, wait for next real request`);
+        continue;
+      }
       const krec: LogRec = {
         ts: clock(), id: requestId(), method: "POST", path: "/keepalive",
         model: "kept", streamIn: false, streamOut: false, convertSse: false,

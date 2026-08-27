@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-nobeta-1h";
+const VERSION = "v7-rebuild";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "1h").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -760,6 +760,70 @@ function logsAuthorized(req: Request, url: URL): boolean {
   return safeEqual(supplied, PROXY_TOKEN);
 }
 
+// ============================================================================
+// Canonical request rebuild — extract semantic content and re-serialize in a
+// deterministic, official-format shape so identical content always produces
+// byte-identical requests (kills LobeHub per-turn serialization drift).
+// ============================================================================
+function sortDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortDeep);
+  if (isObj(v)) {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(v).sort()) out[k] = sortDeep(v[k]);
+    return out;
+  }
+  return v;
+}
+
+function normalizeBlock(b: unknown): unknown {
+  if (!isObj(b)) return b;
+  if (b.type === "text" && typeof b.text === "string") {
+    return { type: "text", text: b.text };
+  }
+  return b;
+}
+
+function normalizeMessage(msg: unknown): unknown {
+  if (!isObj(msg)) return msg;
+  const out: Record<string, unknown> = { role: String(msg.role ?? "user") };
+  if (typeof msg.name === "string") out.name = msg.name;
+  const content = msg.content;
+  if (typeof content === "string") {
+    out.content = content.trim() ? [{ type: "text", text: content }] : [];
+  } else if (Array.isArray(content)) {
+    out.content = content
+      .filter((b) => !(isObj(b) && typeof b.text === "string" && isRuntimeText(b.text)))
+      .map(normalizeBlock);
+  } else {
+    out.content = [];
+  }
+  return out;
+}
+
+function rebuildBody(parsed: Any): Any {
+  const out: Any = {};
+  for (const [k, v] of Object.entries(parsed ?? {})) {
+    if (k === "cache_control") continue;
+    out[k] = v;
+  }
+  if (parsed?.system !== undefined) {
+    const sys = parsed.system;
+    if (typeof sys === "string") {
+      const t = sys.trim();
+      if (t) out.system = [{ type: "text", text: t }];
+    } else if (Array.isArray(sys)) {
+      const blocks = sys
+        .filter((b) => !(isObj(b) && typeof b.text === "string" && isRuntimeText(b.text)))
+        .map(normalizeBlock);
+      if (blocks.length) out.system = blocks;
+    } else {
+      out.system = sys;
+    }
+  }
+  if (Array.isArray(parsed?.messages)) out.messages = parsed.messages.map(normalizeMessage);
+  return out;
+}
+
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = normalizePath(url.pathname);
@@ -887,6 +951,7 @@ async function handler(req: Request): Promise<Response> {
   rec.roles = rolesOf(body);
 
   if (CACHE_ENABLED && isMessages(path)) {
+    body = rebuildBody(body);
     stripOldTime(body);
     normalizeAnthropicMessages(body);
     const inj = injectBreakpoints(body);
@@ -952,6 +1017,7 @@ async function handler(req: Request): Promise<Response> {
 
   if (LOG_BODY) rec.body = sanitizeForLog(body);
 
+  body = sortDeep(body); // deterministic canonical serialization (official format)
   headers.set("content-type", "application/json");
   return await forwardOnce(
     "POST",

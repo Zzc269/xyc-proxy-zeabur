@@ -32,7 +32,7 @@
  */
 
 const PROVIDER = "xyc";
-const VERSION = "v7-pass-stoponmiss";
+const VERSION = "v7-sigprobe";
 const DEFAULT_UPSTREAM = "https://apicdn.xyc.ai";
 const CACHE_TTL = (Deno.env.get("CACHE_TTL") || "5m").toLowerCase() === "1h" ? "1h" : "5m";
 const TTL = CACHE_TTL;
@@ -137,6 +137,7 @@ interface LogRec {
   respLen?: number;
   usage?: Record<string, string>;
   raw?: string;
+  probe?: string;     // 验水指纹 think/sig/sigModel/tok/EMPTY
   error?: string;
   body?: unknown;
 }
@@ -239,6 +240,9 @@ function formatLog(rec: LogRec): string {
   ];
   if (rec.status !== undefined) {
     lines.push(`  status=${rec.status} ms=${rec.ms ?? "-"} respLen=${rec.respLen ?? "-"} ${usageLine(rec)}`);
+  }
+  if (rec.probe) {
+    lines.push(`  probe=${rec.probe}`);
   }
   if (rec.usage) {
     lines.push(`  usageJson=${JSON.stringify(rec.usage)}`);
@@ -614,6 +618,34 @@ function extractUsage(text: string): Record<string, string> {
   return usage;
 }
 
+/** 解码 Anthropic 思考签名中的模型标识（官方签名内置模型名，防伪）。 */
+function sigModelOf(text: string): string {
+  const m = text.match(/"signature"\s*:\s*"([^"]+)"/);
+  if (!m) return "-";
+  const sig = m[1];
+  try {
+    const bin = atob(sig);
+    const mm = bin.match(/claude-[a-z0-9-]+/i);
+    if (mm) return mm[0];
+  } catch {
+  }
+  return `raw:${sig.slice(0, 24)}...`;
+}
+
+/** 验水指纹：从上游响应体提取思考/签名/模型身份/空完成证据。 */
+function probeResponse(text: string): string {
+  const hasThinking = text.includes('"type":"thinking"') || text.includes('"type": "thinking"') || text.includes('"reasoning"');
+  const hasSignature = text.includes('"signature"');
+  const hasEmpty = text.includes('"content":[]') && text.includes('"stop_reason":"end_turn"');
+  const parts = [`think=${hasThinking ? "Y" : "N"}`, `sig=${hasSignature ? "Y" : "N"}`, `sigModel=${sigModelOf(text)}`];
+  for (const k of ["thinking_tokens", "reasoning_tokens"]) {
+    const m = text.match(new RegExp(`"${k}"\s*:\s*(\d+)`));
+    if (m) { parts.push(`tok=${m[1]}`); break; }
+  }
+  if (hasEmpty) parts.push(`EMPTY=YES`);
+  return parts.join(" ");
+}
+
 function responseHeaders(source: Headers, id: string): Headers {
   const out = new Headers(source);
   out.delete("content-encoding");
@@ -686,6 +718,7 @@ function finishLog(rec: LogRec, status: number, ms: number, text: string, ok: bo
   rec.ms = ms;
   rec.respLen = text.length;
   rec.usage = extractUsage(text);
+  rec.probe = probeResponse(text);
   const hasUsage = Boolean(rec.usage && (rec.usage.input_tokens || rec.usage.cache_read_input_tokens || rec.usage.cache_creation_input_tokens));
   if (!ok || !hasUsage) {
     rec.raw = text.slice(0, RAW_LIMIT).replace(/\s+/g, " ");

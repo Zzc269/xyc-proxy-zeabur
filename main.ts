@@ -1,5 +1,5 @@
 // ============================================================
-//  xyc-proxy v9-xyc-1h5m — 断点注入版(sys+tools=1h, messages=5m)
+//  xyc-proxy v9.1-xyc-1h5m — 断点注入版(sys+tools=1h, messages=5m)
 //  ------------------------------------------------------------
 //  覆盖仓库根目录 main.ts 后 push main，Zeabur 自动重部署。
 //  运行: deno run --allow-net --allow-env --allow-read main.ts
@@ -22,7 +22,7 @@
 //        BREAKPOINT_MODE 在透传模式下不再生效，可以删除。
 // ============================================================
 
-const VERSION = "v9-xyc-1h5m";
+const VERSION = "v9.1-xyc-1h5m";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -155,7 +155,11 @@ function injectBp(raw: string): { body: string; n: number } | null {
 
   // 1) 清掉所有旧 cache_control(含 LobeHub 5m ephemeral)
   const clear = (o: any): void => {
-    if (!o || typeof o !== "object" || Array.isArray(o)) return;
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) {
+      for (const v of o) clear(v);
+      return;
+    }
     delete o.cache_control;
     for (const v of Object.values(o)) clear(v);
   };

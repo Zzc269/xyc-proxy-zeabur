@@ -1,14 +1,15 @@
 // ============================================================
-//  xyc-proxy v8-passthrough — 原生透传 + 完整诊断日志
+//  xyc-proxy v9-xyc-1h5m — 断点注入版(sys+tools=1h, messages=5m)
 //  ------------------------------------------------------------
 //  覆盖仓库根目录 main.ts 后 push main，Zeabur 自动重部署。
 //  运行: deno run --allow-net --allow-env --allow-read main.ts
 //
 //  行为:
-//    - POST /v1/messages : 请求体/请求头 一字不改原样转发到 UPSTREAM_URL，
-//      客户端 stream 属性原样保留（不做非流式强制）。
-//    - 所有诊断仅在本地计算/记录，绝不回写请求。
-//    - /logs /logs.json /logs/clear 保留；非 API 路径默认也透传（仅记一行）。
+//    - POST /v1/messages : 仅注入 cache_control 断点(清旧重打):
+//        tools 最后一项=1h ; system 最后一块=1h ; 最后一条 user=5m
+//        正文一字不改, stream 原样保留
+//    - 其他路径: 原生透传
+//    - /logs /logs.json /logs/clear 保留
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc   (不要带尾斜杠)
@@ -21,7 +22,7 @@
 //        BREAKPOINT_MODE 在透传模式下不再生效，可以删除。
 // ============================================================
 
-const VERSION = "v8-passthrough";
+const VERSION = "v9-xyc-1h5m";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -146,6 +147,61 @@ function scanBody(raw: string) {
   };
 }
 
+// ---------- v9 断点注入: sys+tools 1h, messages 5m ----------
+function injectBp(raw: string): { body: string; n: number } | null {
+  let parsed: any;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  // 1) 清掉所有旧 cache_control(含 LobeHub 5m ephemeral)
+  const clear = (o: any): void => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return;
+    delete o.cache_control;
+    for (const v of Object.values(o)) clear(v);
+  };
+  clear(parsed);
+
+  let n = 0;
+  const mark = (o: any, ttl: string): void => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return;
+    if (o.cache_control) return;
+    o.cache_control = { type: "ephemeral", ttl };
+    n++;
+  };
+
+  // 2) tools 最后一项 -> 1h
+  if (Array.isArray(parsed.tools) && parsed.tools.length) {
+    const t = parsed.tools.filter((x: any) => x && typeof x === "object").at(-1);
+    if (t) mark(t, "1h");
+  }
+  // 3) system 最后一块 -> 1h (字符串 -> 包块)
+  if (typeof parsed.system === "string") {
+    if ((parsed.system as string).length) {
+      parsed.system = [{ type: "text", text: parsed.system, cache_control: { type: "ephemeral", ttl: "1h" } }];
+      n++;
+    }
+  } else if (Array.isArray(parsed.system) && parsed.system.length) {
+    const blocks = parsed.system.filter((x: any) => x && typeof x === "object");
+    if (blocks.length) mark(blocks[blocks.length - 1], "1h");
+  }
+  // 4) 最后一条 user 的最后一个 text 块 -> 5m
+  if (Array.isArray(parsed.messages)) {
+    const users = parsed.messages.filter((m: any) => m && typeof m === "object" && m.role === "user");
+    if (users.length) {
+      const last = users[users.length - 1];
+      const c = last.content;
+      if (typeof c === "string" && c.length) {
+        last.content = [{ type: "text", text: c, cache_control: { type: "ephemeral", ttl: "5m" } }];
+        n++;
+      } else if (Array.isArray(c) && c.length) {
+        const texts = c.filter((b: any) => b && typeof b === "object" && b.type === "text");
+        if (texts.length) mark(texts[texts.length - 1], "5m");
+      }
+    }
+  }
+  return { body: JSON.stringify(parsed), n };
+}
+
 // ---------- 上游转发（原样） ----------
 function extractUsage(t: string): string | null {
   const fields: [string, RegExp][] = [
@@ -192,13 +248,19 @@ function collect(e: LogEntry, stream: ReadableStream<Uint8Array>, status: number
   })();
 }
 
-async function forwardMessage(e: LogEntry, raw: string, req: Request): Promise<Response> {
+async function forwardMessage(e: LogEntry, raw: string, req: Request, rewN = 0): Promise<Response> {
   const url = `${UPSTREAM}/v1/messages`;
   const headers = new Headers(req.headers);
   headers.delete("host");
   headers.delete("connection");
   headers.delete("transfer-encoding");
   headers.delete("x-proxy-token"); // 不透传代理自用 token 给上游
+  if (rewN > 0) {
+    const beta = headers.get("anthropic-beta") || "";
+    if (!beta.includes("extended-cache-ttl-2025-04-11")) {
+      headers.set("anthropic-beta", beta ? `${beta} extended-cache-ttl-2025-04-11` : "extended-cache-ttl-2025-04-11");
+    }
+  }
   const t0 = Date.now();
 
   const attempt = async (): Promise<{ resp: Response; ms: number }> => {
@@ -235,7 +297,7 @@ async function forwardMessage(e: LogEntry, raw: string, req: Request): Promise<R
   }
 }
 
-function summaryLine(e: LogEntry, req: Request, s: ReturnType<typeof scanBody>) {
+function summaryLine(e: LogEntry, req: Request, s: ReturnType<typeof scanBody>, rewN = 0) {
   let head = `#${e.id} ${e.t} path=/v1/messages model=${s.model} ` +
     `prompt=${fnv(JSON.stringify(s.parsed?.messages ?? []))}/${s.rawLen} ` +
     `sys=${s.sysHash}/${s.sysLen} tools=${s.toolsHash}/${s.toolsLen} ` +
@@ -245,6 +307,7 @@ function summaryLine(e: LogEntry, req: Request, s: ReturnType<typeof scanBody>) 
     ? ` prefixStable=${s.st.stable} common=${s.st.common} firstDiff=${s.st.firstDiff}`
     : " firstRequest";
   head += ` betaIn=${req.headers.get("anthropic-beta") || "-"}`;
+  if (rewN > 0) head += ` bpInjected=${rewN}`;
   pushLine(e, head);
 }
 
@@ -305,9 +368,13 @@ async function handle(req: Request): Promise<Response> {
     const raw = await req.text();
     const e = addEntry();
     const s = scanBody(raw);
-    summaryLine(e, req, s);
-    if (LOG_BODY) e.body = brief(raw, BODY_CAP);
-    return await forwardMessage(e, raw, req);
+    let outRaw = raw;
+    let rewN = 0;
+    const r = injectBp(raw);
+    if (r && r.n > 0) { outRaw = r.body; rewN = r.n; }
+    summaryLine(e, req, s, rewN);
+    if (LOG_BODY) e.body = brief(outRaw, BODY_CAP);
+    return await forwardMessage(e, outRaw, req, rewN);
   }
   if (PASSTHROUGH_OTHER) return await passthroughGeneric(req, p);
   return json({ error: "not found" }, 404);

@@ -1,5 +1,5 @@
 // ============================================================
-//  xyc-proxy v9.1-xyc-1h5m — 断点注入版(sys+tools=1h, messages=5m)
+//  xyc-proxy v9.2-xyc-1h5m — 断点注入版(sys+tools=1h, messages=5m)
 //  ------------------------------------------------------------
 //  覆盖仓库根目录 main.ts 后 push main，Zeabur 自动重部署。
 //  运行: deno run --allow-net --allow-env --allow-read main.ts
@@ -22,7 +22,7 @@
 //        BREAKPOINT_MODE 在透传模式下不再生效，可以删除。
 // ============================================================
 
-const VERSION = "v9.1-xyc-1h5m";
+const VERSION = "v9.2-xyc-1h5m";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -148,6 +148,22 @@ function scanBody(raw: string) {
 }
 
 // ---------- v9 断点注入: sys+tools 1h, messages 5m ----------
+// ---------- 动态内容稳定化(移植 v8.7): 剔除 LobeHub 每轮注入的漂移块 ----------
+function sanitizeTimeText(s: string): string {
+  let out = s
+    .replace(/<runtime_context[\s\S]*?<\/runtime_context>/g, "")
+    .replace(/<!--\s*pxy8-proxy-runtime-time-v1\s*-->/g, "")
+    .replace(/<!--[^>]*(?:当前时间|当前北京时间|Current time)[^>]*-->/g, "");
+  const lines = out.split("\n");
+  const keep = lines.filter((ln) => !/(当前时间|当前北京时间|Current time|北京时间)\s*[：:]/.test(ln));
+  return keep.join("\n");
+}
+function sanitizeSystemText(s: string): string {
+  return s
+    .replace(/<topic_reference_context>[\s\S]*?<\/topic_reference_context>/g, "")
+    .replace(/<!--\s*SYSTEM CONTEXT[\s\S]*?END SYSTEM CONTEXT\s*-->/g, "");
+}
+
 function injectBp(raw: string): { body: string; n: number } | null {
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { return null; }
@@ -172,6 +188,32 @@ function injectBp(raw: string): { body: string; n: number } | null {
     o.cache_control = { type: "ephemeral", ttl };
     n++;
   };
+
+  // 1.5) 稳定化: 剔除 system / messages 中的动态漂移块(LobeHub 注入)
+  if (typeof parsed.system === "string") {
+    parsed.system = sanitizeSystemText(sanitizeTimeText(parsed.system));
+  } else if (Array.isArray(parsed.system)) {
+    parsed.system.forEach((b: any) => {
+      if (b && typeof b === "object" && typeof b.text === "string") {
+        b.text = sanitizeSystemText(sanitizeTimeText(b.text));
+      }
+    });
+  }
+  if (Array.isArray(parsed.messages)) {
+    parsed.messages.forEach((m: any) => {
+      if (!m || typeof m !== "object") return;
+      const c = m.content;
+      if (typeof c === "string") {
+        m.content = sanitizeSystemText(sanitizeTimeText(c));
+      } else if (Array.isArray(c)) {
+        c.forEach((b: any) => {
+          if (b && typeof b === "object" && typeof b.text === "string") {
+            b.text = sanitizeSystemText(sanitizeTimeText(b.text));
+          }
+        });
+      }
+    });
+  }
 
   // 2) tools 最后一项 -> 1h
   if (Array.isArray(parsed.tools) && parsed.tools.length) {
